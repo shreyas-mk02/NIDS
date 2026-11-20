@@ -1,0 +1,13 @@
+policy,category,kind,flows,score
+Static,BENIGN,specificity,21535,0.9942419317390295
+Static,DDoS,detection rate,2500,0.0
+Static,Web Attack - Brute Force,detection rate,788,0.8489847715736041
+Static,Web Attack - XSS,detection rate,177,0.9322033898305084
+Drift-triggered,BENIGN,specificity,21535,0.9943348038077549
+Drift-triggered,DDoS,detection rate,2500,0.6236
+Drift-triggered,Web Attack - Brute Force,detection rate,788,0.8401015228426396
+Drift-triggered,Web Attack - XSS,detection rate,177,0.9378531073446328
+Periodic,BENIGN,specificity,21535,0.9924309263988855
+Periodic,DDoS,detection rate,2500,0.6968
+Periodic,Web Attack - Brute Force,detection rate,788,0.8388324873096447
+Periodic,Web Attack - XSS,detection rate,177,0.9378531073446328

@@ -1,0 +1,26 @@
+{
+  "n_train": 4328,
+  "n_stream": 40000,
+  "n_pre_onset": 15000,
+  "n_post_onset": 25000,
+  "n_unseen_post_onset": 2500,
+  "row_index_overlap": 0,
+  "feature_fingerprint_overlap": 7,
+  "train_class_distribution": {
+    "BENIGN": 4100,
+    "Web Attack - Brute Force": 182,
+    "Web Attack - XSS": 46
+  },
+  "pre_onset_distribution": {
+    "BENIGN": 14317,
+    "Web Attack - Brute Force": 537,
+    "Web Attack - XSS": 146
+  },
+  "post_onset_distribution": {
+    "BENIGN": 21535,
+    "DDoS": 2500,
+    "Web Attack - Brute Force": 788,
+    "Web Attack - XSS": 177
+  },
+  "stream_type": "constructed replay stream"
+}

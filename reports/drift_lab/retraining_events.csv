@@ -1,0 +1,2 @@
+policy,flow,batch,error_before,error_after,rose,in_cooldown,triggered_retrain
+Drift-triggered,15136,16,0.012025107367030063,0.01644736842105263,True,False,True

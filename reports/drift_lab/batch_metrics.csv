@@ -1,0 +1,161 @@
+policy,batch,evaluated,correct,errors,batch_accuracy,retrained,post_onset
+Static,1,1000,989,11,0.989,False,False
+Static,2,1000,990,10,0.99,False,False
+Static,3,1000,990,10,0.99,False,False
+Static,4,1000,987,13,0.987,False,False
+Static,5,1000,988,12,0.988,False,False
+Static,6,1000,992,8,0.992,False,False
+Static,7,1000,992,8,0.992,False,False
+Static,8,1000,986,14,0.986,False,False
+Static,9,1000,979,21,0.979,False,False
+Static,10,1000,992,8,0.992,False,False
+Static,11,1000,987,13,0.987,False,False
+Static,12,1000,980,20,0.98,False,False
+Static,13,1000,997,3,0.997,False,False
+Static,14,1000,993,7,0.993,False,False
+Static,15,1000,990,10,0.99,False,False
+Static,16,1000,892,108,0.892,False,True
+Static,17,1000,898,102,0.898,False,True
+Static,18,1000,893,107,0.893,False,True
+Static,19,1000,908,92,0.908,False,True
+Static,20,1000,886,114,0.886,False,True
+Static,21,1000,881,119,0.881,False,True
+Static,22,1000,882,118,0.882,False,True
+Static,23,1000,874,126,0.874,False,True
+Static,24,1000,880,120,0.88,False,True
+Static,25,1000,889,111,0.889,False,True
+Static,26,1000,905,95,0.905,False,True
+Static,27,1000,885,115,0.885,False,True
+Static,28,1000,880,120,0.88,False,True
+Static,29,1000,886,114,0.886,False,True
+Static,30,1000,887,113,0.887,False,True
+Static,31,1000,888,112,0.888,False,True
+Static,32,1000,884,116,0.884,False,True
+Static,33,1000,897,103,0.897,False,True
+Static,34,1000,901,99,0.901,False,True
+Static,35,1000,888,112,0.888,False,True
+Static,36,1000,885,115,0.885,False,True
+Static,37,1000,893,107,0.893,False,True
+Static,38,1000,880,120,0.88,False,True
+Static,39,1000,904,96,0.904,False,True
+Static,40,1000,899,101,0.899,False,True
+Periodic,1,1000,989,11,0.989,False,False
+Periodic,2,1000,990,10,0.99,False,False
+Periodic,3,1000,990,10,0.99,False,False
+Periodic,4,1000,987,13,0.987,False,False
+Periodic,5,1000,988,12,0.988,True,False
+Periodic,6,1000,991,9,0.991,False,False
+Periodic,7,1000,994,6,0.994,False,False
+Periodic,8,1000,986,14,0.986,False,False
+Periodic,9,1000,982,18,0.982,False,False
+Periodic,10,1000,992,8,0.992,True,False
+Periodic,11,1000,989,11,0.989,False,False
+Periodic,12,1000,984,16,0.984,False,False
+Periodic,13,1000,998,2,0.998,False,False
+Periodic,14,1000,994,6,0.994,False,False
+Periodic,15,1000,990,10,0.99,True,False
+Periodic,16,1000,892,108,0.892,False,True
+Periodic,17,1000,899,101,0.899,False,True
+Periodic,18,1000,892,108,0.892,False,True
+Periodic,19,1000,907,93,0.907,False,True
+Periodic,20,1000,886,114,0.886,True,True
+Periodic,21,1000,963,37,0.963,False,True
+Periodic,22,1000,968,32,0.968,False,True
+Periodic,23,1000,956,44,0.956,False,True
+Periodic,24,1000,971,29,0.971,False,True
+Periodic,25,1000,967,33,0.967,True,True
+Periodic,26,1000,980,20,0.98,False,True
+Periodic,27,1000,966,34,0.966,False,True
+Periodic,28,1000,980,20,0.98,False,True
+Periodic,29,1000,969,31,0.969,False,True
+Periodic,30,1000,980,20,0.98,True,True
+Periodic,31,1000,973,27,0.973,False,True
+Periodic,32,1000,980,20,0.98,False,True
+Periodic,33,1000,977,23,0.977,False,True
+Periodic,34,1000,981,19,0.981,False,True
+Periodic,35,1000,972,28,0.972,True,True
+Periodic,36,1000,974,26,0.974,False,True
+Periodic,37,1000,973,27,0.973,False,True
+Periodic,38,1000,981,19,0.981,False,True
+Periodic,39,1000,984,16,0.984,False,True
+Periodic,40,1000,970,30,0.97,True,True
+Drift-triggered,1,1000,989,11,0.989,False,False
+Drift-triggered,2,1000,990,10,0.99,False,False
+Drift-triggered,3,1000,990,10,0.99,False,False
+Drift-triggered,4,1000,987,13,0.987,False,False
+Drift-triggered,5,1000,988,12,0.988,False,False
+Drift-triggered,6,1000,992,8,0.992,False,False
+Drift-triggered,7,1000,992,8,0.992,False,False
+Drift-triggered,8,1000,986,14,0.986,False,False
+Drift-triggered,9,1000,979,21,0.979,False,False
+Drift-triggered,10,1000,992,8,0.992,False,False
+Drift-triggered,11,1000,987,13,0.987,False,False
+Drift-triggered,12,1000,980,20,0.98,False,False
+Drift-triggered,13,1000,997,3,0.997,False,False
+Drift-triggered,14,1000,993,7,0.993,False,False
+Drift-triggered,15,1000,990,10,0.99,False,False
+Drift-triggered,16,1000,892,108,0.892,True,True
+Drift-triggered,17,1000,962,38,0.962,False,True
+Drift-triggered,18,1000,957,43,0.957,False,True
+Drift-triggered,19,1000,971,29,0.971,False,True
+Drift-triggered,20,1000,942,58,0.942,False,True
+Drift-triggered,21,1000,944,56,0.944,False,True
+Drift-triggered,22,1000,950,50,0.95,False,True
+Drift-triggered,23,1000,946,54,0.946,False,True
+Drift-triggered,24,1000,955,45,0.955,False,True
+Drift-triggered,25,1000,948,52,0.948,False,True
+Drift-triggered,26,1000,963,37,0.963,False,True
+Drift-triggered,27,1000,950,50,0.95,False,True
+Drift-triggered,28,1000,969,31,0.969,False,True
+Drift-triggered,29,1000,956,44,0.956,False,True
+Drift-triggered,30,1000,956,44,0.956,False,True
+Drift-triggered,31,1000,947,53,0.947,False,True
+Drift-triggered,32,1000,955,45,0.955,False,True
+Drift-triggered,33,1000,957,43,0.957,False,True
+Drift-triggered,34,1000,958,42,0.958,False,True
+Drift-triggered,35,1000,947,53,0.947,False,True
+Drift-triggered,36,1000,950,50,0.95,False,True
+Drift-triggered,37,1000,955,45,0.955,False,True
+Drift-triggered,38,1000,953,47,0.953,False,True
+Drift-triggered,39,1000,966,34,0.966,False,True
+Drift-triggered,40,1000,951,49,0.951,False,True
+Online HAT,1,1000,982,18,0.982,False,False
+Online HAT,2,1000,987,13,0.987,False,False
+Online HAT,3,1000,989,11,0.989,False,False
+Online HAT,4,1000,988,12,0.988,False,False
+Online HAT,5,1000,990,10,0.99,False,False
+Online HAT,6,1000,991,9,0.991,False,False
+Online HAT,7,1000,996,4,0.996,False,False
+Online HAT,8,1000,988,12,0.988,False,False
+Online HAT,9,1000,988,12,0.988,False,False
+Online HAT,10,1000,992,8,0.992,False,False
+Online HAT,11,1000,993,7,0.993,False,False
+Online HAT,12,1000,987,13,0.987,False,False
+Online HAT,13,1000,1000,0,1.0,False,False
+Online HAT,14,1000,996,4,0.996,False,False
+Online HAT,15,1000,993,7,0.993,False,False
+Online HAT,16,1000,887,113,0.887,False,True
+Online HAT,17,1000,960,40,0.96,False,True
+Online HAT,18,1000,989,11,0.989,False,True
+Online HAT,19,1000,995,5,0.995,False,True
+Online HAT,20,1000,986,14,0.986,False,True
+Online HAT,21,1000,980,20,0.98,False,True
+Online HAT,22,1000,990,10,0.99,False,True
+Online HAT,23,1000,986,14,0.986,False,True
+Online HAT,24,1000,993,7,0.993,False,True
+Online HAT,25,1000,990,10,0.99,False,True
+Online HAT,26,1000,988,12,0.988,False,True
+Online HAT,27,1000,979,21,0.979,False,True
+Online HAT,28,1000,987,13,0.987,False,True
+Online HAT,29,1000,984,16,0.984,False,True
+Online HAT,30,1000,988,12,0.988,False,True
+Online HAT,31,1000,982,18,0.982,False,True
+Online HAT,32,1000,987,13,0.987,False,True
+Online HAT,33,1000,990,10,0.99,False,True
+Online HAT,34,1000,998,2,0.998,False,True
+Online HAT,35,1000,993,7,0.993,False,True
+Online HAT,36,1000,995,5,0.995,False,True
+Online HAT,37,1000,993,7,0.993,False,True
+Online HAT,38,1000,987,13,0.987,False,True
+Online HAT,39,1000,993,7,0.993,False,True
+Online HAT,40,1000,988,12,0.988,False,True

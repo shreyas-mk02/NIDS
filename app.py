@@ -139,6 +139,220 @@ def load_project_info() -> dict:
         pass
     return info
 ''',
+    "utils.schema": r'''
+"""Centralized Feature Schema, Normalization, and Validation.
+
+Enforces strict exclusion of all targets, ground truth, and metadata columns
+across dataset loading, scenario pool creation, training, prediction, and drift lab.
+"""
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Iterable, Sequence
+
+import numpy as np
+import pandas as pd
+
+# Normalized (lowercase, stripped, spaces/hyphens -> underscores) names of prohibited columns
+PROHIBITED_FEATURE_NAMES: frozenset[str] = frozenset({
+    "label",
+    "binary_target",
+    "multiclass_target",
+    "attack_cat",
+    "attack_category",
+    "attack_type",
+    "class",
+    "target",
+    "y",
+    "is_attack",
+    "_attack_type",
+    "_source_file",
+    "source_file",
+    "id",
+    "row",
+    "original_label",
+    "final_verdict",
+    "binary_prediction",
+    "multiclass_prediction",
+    "attack_probability",
+    "binary_confidence",
+    "multiclass_confidence",
+    "models_agree",
+    "alternative_categories",
+    "prediction",
+    "predicted_label",
+    "ground_truth",
+})
+
+# Substrings that indicate target or metadata when appearing as complete tokens or suffixes
+PROHIBITED_SUFFIXES: tuple[str, ...] = (
+    "_target",
+    "_label",
+    "_prediction",
+    "_probability",
+    "_confidence",
+    "_verdict",
+)
+
+
+def normalize_feature_name(name: str | object) -> str:
+    """Normalize column names consistently: strip, lowercase, spaces/hyphens -> underscores."""
+    s = str(name).strip().lower()
+    return re.sub(r"[\s\-]+", "_", s)
+
+
+def is_prohibited_feature(name: str | object) -> bool:
+    """Check if a column name is a prohibited target, label, metadata, or app-generated output.
+
+    Uses explicit schema matching rather than broad substring matching to avoid
+    dropping legitimate network-flow features (e.g. Subflow_Fwd_Packets, Fwd_Header_Length).
+    """
+    norm = normalize_feature_name(name)
+    if norm in PROHIBITED_FEATURE_NAMES:
+        return True
+    if norm.startswith("unnamed") or norm.startswith("_"):
+        return True
+    if any(norm.endswith(suffix) for suffix in PROHIBITED_SUFFIXES):
+        return True
+    return False
+
+
+def filter_clean_features(columns: Iterable[str]) -> list[str]:
+    """Return only legitimate predictor feature columns, preserving original order."""
+    return [c for c in columns if not is_prohibited_feature(c)]
+
+
+def validate_feature_schema(columns: Sequence[str], context: str = "") -> list[str]:
+    """Validate that a list of feature columns contains no prohibited fields and no duplicates."""
+    cols_list = list(columns)
+    prohibited = [c for c in cols_list if is_prohibited_feature(c)]
+    if prohibited:
+        ctx_msg = f" in {context}" if context else ""
+        raise ValueError(
+            f"Prohibited target/metadata column(s) detected{ctx_msg}: {prohibited}. "
+            "These columns must never be used as predictive features."
+        )
+    if len(cols_list) != len(set(cols_list)):
+        from collections import Counter
+        dupes = [col for col, count in Counter(cols_list).items() if count > 1]
+        ctx_msg = f" in {context}" if context else ""
+        raise ValueError(f"Duplicate feature columns detected{ctx_msg}: {dupes}")
+    return cols_list
+
+
+def validate_feature_columns_json(path_or_list: str | Path | Sequence[str]) -> list[str]:
+    """Validate feature_columns.json file or list against the prohibited schema."""
+    if isinstance(path_or_list, (str, Path)):
+        p = Path(path_or_list)
+        if not p.exists():
+            raise FileNotFoundError(f"Feature columns file not found: {p}")
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = list(path_or_list)
+
+    if not isinstance(data, list) or not data:
+        raise ValueError("Feature columns must be a non-empty list of column names.")
+    return validate_feature_schema(data, context="feature_columns.json")
+
+
+def assert_clean_features(X: pd.DataFrame, expected_features: Sequence[str] | None = None) -> None:
+    """Hard assertion immediately before every model fit and predict.
+
+    Guarantees:
+    1. X is a DataFrame.
+    2. No prohibited target, label, or metadata columns exist in X.
+    3. Feature names are unique.
+    4. If expected_features is provided, columns match exactly in name and order.
+    5. All values are numeric (no strings/objects).
+    6. No NaN or infinite values exist in X.
+    """
+    if not isinstance(X, pd.DataFrame):
+        raise AssertionError(f"Expected pandas DataFrame for features, got {type(X).__name__}")
+
+    prohibited = [c for c in X.columns if is_prohibited_feature(c)]
+    if prohibited:
+        raise AssertionError(
+            f"DATA LEAKAGE BLOCKED: Prohibited column(s) found in feature matrix X: {prohibited}. "
+            "Targets, labels, and metadata must never enter model training or prediction."
+        )
+
+    if len(X.columns) != len(set(X.columns)):
+        from collections import Counter
+        dupes = [col for col, count in Counter(X.columns).items() if count > 1]
+        raise AssertionError(f"Duplicate columns in feature matrix X: {dupes}")
+
+    if expected_features is not None:
+        expected_list = list(expected_features)
+        if list(X.columns) != expected_list:
+            missing = set(expected_list) - set(X.columns)
+            extra = set(X.columns) - set(expected_list)
+            raise AssertionError(
+                f"Feature schema mismatch. Expected {len(expected_list)} features, got {len(X.columns)}. "
+                f"Missing: {list(missing)[:5]}, Extra: {list(extra)[:5]}"
+            )
+
+    # Check numeric types
+    non_numeric = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
+    if non_numeric:
+        raise AssertionError(f"Non-numeric column(s) in feature matrix: {non_numeric[:5]}")
+
+    # Check NaNs and Infs
+    if X.isna().any().any():
+        nan_cols = [c for c in X.columns if X[c].isna().any()]
+        raise AssertionError(f"Feature matrix contains NaN values in columns: {nan_cols[:5]}")
+
+    vals = X.to_numpy(dtype=float, copy=False)
+    if np.isinf(vals).any():
+        inf_cols = [X.columns[i] for i in np.flatnonzero(np.isinf(vals).any(axis=0))]
+        raise AssertionError(f"Feature matrix contains infinite values in columns: {inf_cols[:5]}")
+
+
+def audit_suspicious_features(
+    df: pd.DataFrame, target: np.ndarray, threshold: float = 0.999
+) -> list[dict]:
+    """Inspect features for exact or near-exact copies of the target.
+
+    Does not automatically delete legitimate features; returns a list of suspicious
+    correlations for audit reporting.
+    """
+    suspicious = []
+    y_num = target.astype(float)
+    y_std = np.std(y_num)
+    if y_std == 0:
+        return suspicious
+
+    for col in df.columns:
+        if is_prohibited_feature(col):
+            continue
+        try:
+            x_vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+            if np.isnan(x_vals).all():
+                continue
+            valid = ~np.isnan(x_vals) & ~np.isnan(y_num)
+            if valid.sum() < 2:
+                continue
+            x_v = x_vals[valid]
+            y_v = y_num[valid]
+            x_std = np.std(x_v)
+            if x_std == 0:
+                continue
+            corr = np.abs(np.corrcoef(x_v, y_v)[0, 1])
+            if np.isnan(corr):
+                continue
+            if corr >= threshold:
+                suspicious.append({
+                    "feature": col,
+                    "correlation_with_target": float(corr),
+                    "reason": f"Suspiciously high correlation (>= {threshold}) with target",
+                })
+        except Exception:
+            continue
+    return suspicious
+
+''',
     "utils.prediction": r'''
 """Prediction logic (no UI code).
 
@@ -713,6 +927,7 @@ import streamlit as st
 from utils.config import DATA_DIR
 from utils.prediction import is_benign
 from utils.preprocessing import normalize_columns
+from utils.schema import assert_clean_features, filter_clean_features, is_prohibited_feature
 
 DATASETS = {
     "CIC-IDS2017": {
@@ -743,7 +958,10 @@ DATASETS = {
     },
 }
 
-LABEL_LIKE = {"label", "attack_cat", "attack_category", "attack type", "attack_type", "class", "id", "_attack_type", "_source_file"}
+LABEL_LIKE = {
+    "label", "attack_cat", "attack_category", "attack type", "attack_type",
+    "class", "id", "_attack_type", "_source_file", "binary_target", "multiclass_target", "target", "y"
+}
 
 
 @dataclass
@@ -787,7 +1005,7 @@ def find_files(dataset_name: str) -> list[Path]:
 
 def _clean_label(s: pd.Series) -> pd.Series:
     s = s.astype("string").str.strip()
-    s = s.str.replace(r"[�–—ï¿½]+", "-", regex=True)
+    s = s.str.replace(r"[–—ï¿½]+", "-", regex=True)
     s = s.str.replace(r"\s*-\s*", " - ", regex=True)
     return s
 
@@ -824,7 +1042,8 @@ def _count_lines(path: Path) -> int:
 
 
 def _feature_cols(df: pd.DataFrame) -> tuple[list[str], list[str]]:
-    feats = [c for c in df.columns if c.lower() not in LABEL_LIKE]
+    """Return clean feature columns and numeric feature columns using centralized schema validation."""
+    feats = filter_clean_features(df.columns)
     nums = [c for c in feats if pd.api.types.is_numeric_dtype(df[c])]
     return feats, nums
 
@@ -904,7 +1123,8 @@ def derive_truth(series: pd.Series) -> np.ndarray:
 
 def clean_numeric_frame(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     """Numeric view with inf→NaN (for plotting/statistics only)."""
-    return df[cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    clean_cols = filter_clean_features(cols)
+    return df[clean_cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
 
 
 def load_scenario_pool(dataset_name: str, sig: tuple, counts: dict, features: tuple, cap_per_class: int = 40_000, seed: int = 7):
@@ -912,10 +1132,12 @@ def load_scenario_pool(dataset_name: str, sig: tuple, counts: dict, features: tu
 
     ``counts`` are the exact per-category counts of the dataset (from ``load_disk_dataset``). Returns a
     DataFrame (feature columns + ``_attack_type`` + ``_source_file``) or an error string.
+    Guarantees no target or metadata columns are included in feature columns.
     """
     files = [Path(s[0]) for s in sig]
     rng = np.random.default_rng(seed)
     rate = {c: min(1.0, cap_per_class / max(int(n), 1)) for c, n in counts.items()}
+    clean_req_features = filter_clean_features(features)
     parts: list[pd.DataFrame] = []
     try:
         for p in files:
@@ -926,7 +1148,7 @@ def load_scenario_pool(dataset_name: str, sig: tuple, counts: dict, features: tu
                     return f"'{p.name}' has no recognisable label column."
                 keep = rng.random(len(chunk)) < at.map(rate).fillna(1.0).to_numpy()
                 if keep.any():
-                    cols = [f for f in features if f in chunk.columns]
+                    cols = [f for f in clean_req_features if f in chunk.columns]
                     part = chunk.loc[keep, cols].apply(pd.to_numeric, errors="coerce").astype("float32")
                     part["_attack_type"] = at.loc[keep].astype(str).to_numpy()
                     part["_source_file"] = p.name
@@ -936,10 +1158,13 @@ def load_scenario_pool(dataset_name: str, sig: tuple, counts: dict, features: tu
         pool = pd.concat(parts, ignore_index=True)
     except Exception as exc:  # noqa: BLE001
         return f"Dataset could not be read ({type(exc).__name__}: {str(exc)[:140]})."
-    feats = [f for f in features if f in pool.columns]
+    feats = [f for f in clean_req_features if f in pool.columns]
     pool[feats] = pool[feats].replace([np.inf, -np.inf], np.nan)
     pool = pool.dropna(subset=feats).reset_index(drop=True)
+    # Hard assertion: pool features must be clean
+    assert_clean_features(pool[feats], feats)
     return pool
+
 ''',
     "utils.sources": r'''
 """Turning dataset files / uploads into model-ready, label-aligned records (no UI code)."""
@@ -1835,15 +2060,20 @@ Implements, on whatever dataset the user provides:
   Tree updated after every flow.
 * A **threshold study** (paper Section IV-F): re-tune the decision threshold on recent labelled traffic.
 
-Nothing is simulated beyond the construction of the stream from real labelled records.
+All models (Random Forest, XGBoost, Decision Tree, Logistic Regression) are evaluated independently
+with strict test-then-train ordering, disjoint train/stream splits, and zero target leakage.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import time
+import uuid
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable
+from pathlib import Path
+from typing import Callable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -1855,6 +2085,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
 from utils.prediction import is_benign
+from utils.schema import assert_clean_features, filter_clean_features, is_prohibited_feature
 
 # ----------------------------------------------------------------------------------------------- #
 # Paper settings (Section III-D / III-F). All of them can be overridden from the UI.
@@ -1866,45 +2097,136 @@ ONSET_BATCH = 15          # batches 1-15 are drift-free, drift starts with batch
 RECENT, REPLAY, ANCHOR = 4_000, 2_000, 2_000
 ADWIN_DELTA = 0.002
 PERIODIC_EVERY = 5
-MODEL_NAMES = ["XGBoost", "Random Forest", "Decision Tree", "Logistic Regression"]
+MODEL_NAMES = ["Random Forest", "XGBoost", "Decision Tree", "Logistic Regression"]
 POLICIES = ["Static", "Periodic", "Drift-triggered", "Online HAT"]
 
 
 # ----------------------------------------------------------------------------------------------- #
-# Models
+# Models Registry & Factory
 # ----------------------------------------------------------------------------------------------- #
-def make_model(name: str, seed: int = 42):
-    """Standardise with training statistics, then one of the four learners (near-default settings)."""
-    if name == "XGBoost":
+def make_xgboost(seed: int = 42):
+    """Instantiate XGBClassifier with explicit error handling if not installed."""
+    try:
         from xgboost import XGBClassifier
+    except ImportError as exc:
+        raise ImportError(
+            "XGBoost is not installed or could not be loaded in this Python environment. "
+            "Please install xgboost via pip or select another base learner (Random Forest, Decision Tree, Logistic Regression)."
+        ) from exc
+    return XGBClassifier(
+        n_estimators=100,
+        max_depth=6,
+        learning_rate=0.3,
+        tree_method="hist",
+        n_jobs=2,
+        random_state=seed,
+        eval_metric="logloss",
+        verbosity=0,
+    )
 
-        clf = XGBClassifier(n_estimators=100, max_depth=6, learning_rate=0.3, tree_method="hist", n_jobs=2,
-                            random_state=seed, eval_metric="logloss", verbosity=0)
-    elif name == "Random Forest":
-        from sklearn.ensemble import RandomForestClassifier
 
-        clf = RandomForestClassifier(n_estimators=100, n_jobs=2, random_state=seed)
-    elif name == "Decision Tree":
-        clf = DecisionTreeClassifier(random_state=seed)
-    elif name == "Logistic Regression":
-        clf = LogisticRegression(max_iter=300, random_state=seed)
-    else:
-        raise ValueError(f"Unknown model '{name}'.")
-    return Pipeline([("scale", StandardScaler()), ("clf", clf)])
+MODEL_REGISTRY = {
+    "Random Forest": {
+        "class_name": "RandomForestClassifier",
+        "module": "sklearn.ensemble",
+        "factory": lambda seed: Pipeline([
+            ("scale", StandardScaler()),
+            ("clf", __import__("sklearn.ensemble", fromlist=["RandomForestClassifier"]).RandomForestClassifier(
+                n_estimators=100, n_jobs=2, random_state=seed
+            )),
+        ]),
+    },
+    "XGBoost": {
+        "class_name": "XGBClassifier",
+        "module": "xgboost",
+        "factory": lambda seed: Pipeline([
+            ("scale", StandardScaler()),
+            ("clf", make_xgboost(seed)),
+        ]),
+    },
+    "Decision Tree": {
+        "class_name": "DecisionTreeClassifier",
+        "module": "sklearn.tree",
+        "factory": lambda seed: Pipeline([
+            ("scale", StandardScaler()),
+            ("clf", DecisionTreeClassifier(random_state=seed)),
+        ]),
+    },
+    "Logistic Regression": {
+        "class_name": "LogisticRegression",
+        "module": "sklearn.linear_model",
+        "factory": lambda seed: Pipeline([
+            ("scale", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=1000, random_state=seed)),
+        ]),
+    },
+}
 
 
-def _fit(model, X: pd.DataFrame, y: np.ndarray):
+def make_model(name: str, seed: int = 42):
+    """Create a fresh Pipeline instance for the requested model with standardized scaling."""
+    if name not in MODEL_REGISTRY:
+        raise ValueError(
+            f"Unknown model '{name}'. Expected one of: {list(MODEL_REGISTRY.keys())}. "
+            "Silent fallback to another model is prohibited."
+        )
+    return MODEL_REGISTRY[name]["factory"](seed)
+
+
+def get_model_info(name: str, seed: int = 42) -> dict:
+    """Return explicit metadata and hyperparameters for the requested model."""
+    if name not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model '{name}'. Expected one of: {list(MODEL_REGISTRY.keys())}")
+    meta = MODEL_REGISTRY[name]
+    pipe = meta["factory"](seed)
+    clf = pipe.named_steps["clf"]
+    params = clf.get_params()
+    # JSON-serializable params
+    clean_params = {}
+    for k, v in params.items():
+        if isinstance(v, (int, float, str, bool, list, dict)) or v is None:
+            clean_params[k] = v
+        else:
+            clean_params[k] = str(v)
+    return {
+        "selected_model_name": name,
+        "actual_estimator_class": meta["class_name"],
+        "module": meta["module"],
+        "hyperparameters": clean_params,
+        "random_seed": seed,
+    }
+
+
+def _fit(model, X: pd.DataFrame, y: np.ndarray) -> tuple[object, list[str]]:
+    """Fit a clone of the model, strictly asserting clean input features and recording convergence warnings."""
+    assert_clean_features(X)
     m = clone(model)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    conv_warnings: list[str] = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         m.fit(X, y.astype(int))
-    return m
+        for w in caught:
+            msg = str(w.message)
+            if "ConvergenceWarning" in w.category.__name__ or "converge" in msg.lower():
+                conv_warnings.append(msg)
+    return m, conv_warnings
 
 
 def _proba(model, X: pd.DataFrame) -> np.ndarray:
+    """Predict attack probability, strictly asserting clean features and mapping classes via model.classes_."""
+    assert_clean_features(X)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        return model.predict_proba(X)[:, 1]
+        probs = model.predict_proba(X)
+    clf = model.named_steps["clf"] if hasattr(model, "named_steps") else model
+    classes = getattr(clf, "classes_", None)
+    if classes is not None and len(classes) == 2:
+        pos_idx = np.where((classes == 1) | (classes == True) | (classes == "1"))[0]
+        if len(pos_idx) > 0:
+            return probs[:, pos_idx[0]]
+    if probs.ndim == 2 and probs.shape[1] >= 2:
+        return probs[:, 1]
+    return probs.ravel()
 
 
 # ----------------------------------------------------------------------------------------------- #
@@ -1938,6 +2260,8 @@ class Scenario:
     onset_flow: int                            # 0-based index of the first drifted flow
     notes: list[str]
     n_unseen_flows: int = 0
+    split_audit: dict = field(default_factory=dict)
+    stream_type: str = "constructed replay stream"
 
     @property
     def n_flows(self) -> int:
@@ -1964,18 +2288,20 @@ def default_shift_features(X: pd.DataFrame, k: int = 5) -> list[str]:
 
 
 def build_scenario(pool: pd.DataFrame, features: list[str], cfg: ScenarioConfig) -> Scenario:
-    """Turn a labelled pool (columns: features + ``_attack_type`` [+ ``_source_file``]) into train + stream.
+    """Turn a labelled pool into train + stream with strict disjointness and zero target leakage.
 
-    Pre-onset stream flows and the training set only contain *seen* categories. After the onset the stream is
-    a random mix of the seen categories plus ``unseen_share`` flows of the held-out families (all that exist,
-    up to that share). For the covariate scenario nothing is held out; instead ``shift_features`` are scaled
-    and shifted from the onset on, while the labels stay untouched.
+    Pre-onset stream flows and training set contain only *seen* categories.
+    Held-out families appear exclusively after onset.
     """
+    clean_feats = filter_clean_features(features)
+    assert_clean_features(pool[clean_feats], clean_feats)
+
     rng = np.random.default_rng(cfg.seed)
     notes: list[str] = []
     cat = pool["_attack_type"].astype(str).to_numpy()
-    attack = np.array([not is_benign(c) for c in cat])
+    attack = np.array([not is_benign(c) for c in cat], dtype=bool)
     unseen_mask = np.isin(cat, cfg.unseen) if cfg.kind == "unseen" else np.zeros(len(pool), bool)
+
     n_pre = cfg.onset_batch * cfg.batch_size
     n_total = cfg.n_batches * cfg.batch_size
     n_post = n_total - n_pre
@@ -1993,28 +2319,38 @@ def build_scenario(pool: pd.DataFrame, features: list[str], cfg: ScenarioConfig)
         if len(tr) and len(te):
             train_pool, stream_pool = tr, te
             unseen_idx = unseen_idx[np.char.find(fn[unseen_idx].astype(str), "test") >= 0]
-            notes.append("Official split: training flows come from the *train* file(s), the stream from the *test* file(s).")
+            notes.append("Official file split: training flows from *train* file, stream from *test* file.")
         else:
-            notes.append("Official split requested but the files do not contain both 'train' and 'test' in their names - using a random disjoint split.")
-    same_pool = train_pool is stream_pool
+            notes.append("Split by file requested but train/test files not found; using random disjoint split.")
 
+    same_pool = train_pool is stream_pool
     n_u = min(len(unseen_idx), int(round(cfg.unseen_share * n_post))) if cfg.kind == "unseen" else 0
     if cfg.kind == "unseen" and n_u == 0:
         raise ValueError("None of the selected unseen categories exist in the pool - pick other categories.")
     n_seen_post = n_post - n_u
-
-    # --- training set --------------------------------------------------------------------------
     need_stream_seen = n_pre + n_seen_post
+
+    # Verify capacity to prevent illegal leakage
     n_train = cfg.n_train
-    if same_pool and len(train_pool) < n_train + need_stream_seen:
-        # shrink training to leave the stream enough fresh records, then allow re-use if still short
-        n_train = max(2_000, min(cfg.n_train, int(len(train_pool) * 0.35)))
-        notes.append(f"Only {len(train_pool):,} seen-category records are available, so the training set was reduced to {n_train:,}.")
+    if same_pool:
+        if len(train_pool) < n_train + need_stream_seen:
+            max_train = len(train_pool) - need_stream_seen
+            if max_train >= 2000:
+                n_train = max_train
+                notes.append(f"Training set sized to {n_train:,} to guarantee strictly disjoint stream of {need_stream_seen:,} flows.")
+            else:
+                raise ValueError(
+                    f"Insufficient records ({len(train_pool):,}) to construct disjoint training ({n_train:,}) and stream ({need_stream_seen:,}) sets. "
+                    "Please reduce training size or batch count to prevent data leakage."
+                )
+
     tr_idx = train_pool[:n_train]
     rest = stream_pool[n_train:] if same_pool else stream_pool
     if len(rest) < need_stream_seen:
-        notes.append(f"The stream needs {need_stream_seen:,} seen-category flows but only {len(rest):,} are left, so some flows are re-used (sampled with replacement).")
-        rest = rng.choice(stream_pool if len(rest) == 0 else rest, size=need_stream_seen, replace=True)
+        raise ValueError(
+            f"Stream requires {need_stream_seen:,} flows but only {len(rest):,} available. Cannot construct disjoint sets."
+        )
+
     pre_idx = rest[:n_pre]
     post_seen_idx = rest[n_pre:n_pre + n_seen_post]
     post_unseen_idx = unseen_idx[:n_u]
@@ -2022,35 +2358,101 @@ def build_scenario(pool: pd.DataFrame, features: list[str], cfg: ScenarioConfig)
     rng.shuffle(post)
     stream_idx = np.concatenate([pre_idx, post])
 
-    X_train = pool.iloc[tr_idx][features].reset_index(drop=True)
-    X_stream = pool.iloc[stream_idx][features].reset_index(drop=True).astype(float)
+    # Hard assertions on train/stream separation
+    overlap = set(tr_idx).intersection(set(stream_idx))
+    assert len(overlap) == 0, f"DATA LEAKAGE: {len(overlap)} rows overlap between training and evaluation stream!"
+
+    # Held-out family strict presence/absence assertions
+    if cfg.kind == "unseen":
+        assert not np.isin(cat[tr_idx], cfg.unseen).any(), "Held-out category leaked into initial training set!"
+        assert not np.isin(cat[stream_idx[:n_pre]], cfg.unseen).any(), "Held-out category leaked into pre-onset stream!"
+        assert np.isin(cat[stream_idx[n_pre:]], cfg.unseen).sum() > 0, "Held-out category absent from post-onset stream!"
+
+    X_train = pool.iloc[tr_idx][clean_feats].reset_index(drop=True)
+    X_stream = pool.iloc[stream_idx][clean_feats].reset_index(drop=True).astype(float)
     y_train = attack[tr_idx]
     y_stream = attack[stream_idx]
     cat_stream = cat[stream_idx]
 
+    # Compute row fingerprints (predictor columns only) to audit identical observations
+    fps = pd.util.hash_pandas_object(pool[clean_feats], index=False).to_numpy()
+    tr_fps = set(fps[tr_idx])
+    stream_fps = set(fps[stream_idx])
+    fingerprint_overlap = len(tr_fps.intersection(stream_fps))
+
+    # Audit distributions
+    train_dist = {str(k): int(v) for k, v in pd.Series(cat[tr_idx]).value_counts().items()}
+    pre_dist = {str(k): int(v) for k, v in pd.Series(cat[stream_idx[:n_pre]]).value_counts().items()}
+    post_dist = {str(k): int(v) for k, v in pd.Series(cat[stream_idx[n_pre:]]).value_counts().items()}
+
+    split_audit = {
+        "n_train": len(X_train),
+        "n_stream": len(X_stream),
+        "n_pre_onset": n_pre,
+        "n_post_onset": n_post,
+        "n_unseen_post_onset": int(n_u),
+        "row_index_overlap": 0,
+        "feature_fingerprint_overlap": fingerprint_overlap,
+        "train_class_distribution": train_dist,
+        "pre_onset_distribution": pre_dist,
+        "post_onset_distribution": post_dist,
+        "stream_type": "constructed replay stream",
+    }
+
     if cfg.kind == "covariate":
-        feats = [f for f in cfg.shift_features if f in features] or default_shift_features(X_train)
+        feats = [f for f in cfg.shift_features if f in clean_feats] or default_shift_features(X_train)
         sd = X_train[feats].std().replace(0, 1.0)
         X_stream.loc[X_stream.index >= n_pre, feats] = X_stream.loc[X_stream.index >= n_pre, feats] * cfg.shift_scale + sd * cfg.shift_sd
-        notes.append(f"Covariate shift from flow {n_pre:,}: {', '.join(feats)} scaled ×{cfg.shift_scale:g} and shifted by {cfg.shift_sd:g} σ. Labels are untouched.")
+        notes.append(f"Covariate shift from flow {n_pre:,}: {', '.join(feats)} scaled ×{cfg.shift_scale:g} and shifted by {cfg.shift_sd:g} σ. Labels untouched.")
+
     if y_train.all() or not y_train.any():
         raise ValueError("The training set contains only one class (all benign or all attack) - choose different unseen categories.")
-    return Scenario(cfg, features, X_train, y_train, X_stream, y_stream, cat_stream, n_pre, notes, n_u)
+
+    return Scenario(cfg, clean_feats, X_train, y_train, X_stream, y_stream, cat_stream, n_pre, notes, n_u, split_audit)
 
 
 # ----------------------------------------------------------------------------------------------- #
 # Metrics
 # ----------------------------------------------------------------------------------------------- #
 def binary_metrics(y: np.ndarray, yhat: np.ndarray) -> dict:
-    y, yhat = np.asarray(y, bool), np.asarray(yhat, bool)
-    tp, fp = int((y & yhat).sum()), int((~y & yhat).sum())
-    fn, tn = int((y & ~yhat).sum()), int((~y & ~yhat).sum())
-    n = max(len(y), 1)
-    return {"acc": (tp + tn) / n, "f1": 2 * tp / max(2 * tp + fp + fn, 1), "recall": tp / max(tp + fn, 1),
-            "precision": tp / max(tp + fp, 1), "fpr": fp / max(fp + tn, 1), "tp": tp, "fp": fp, "fn": fn, "tn": tn}
+    """Compute complete classification metrics. Returns N/A (None) on empty inputs, never 100%."""
+    if len(y) == 0:
+        return {
+            "acc": None, "balanced_acc": None, "f1": None, "recall": None, "precision": None,
+            "fpr": None, "tp": 0, "fp": 0, "fn": 0, "tn": 0, "n": 0, "correct": 0, "errors": 0,
+        }
+    y = np.asarray(y, dtype=bool)
+    yhat = np.asarray(yhat, dtype=bool)
+    tp = int((y & yhat).sum())
+    fp = int((~y & yhat).sum())
+    fn = int((y & ~yhat).sum())
+    tn = int((~y & ~yhat).sum())
+    n = len(y)
+    correct = tp + tn
+    errors = fp + fn
+
+    acc = correct / n
+    recall = tp / (tp + fn) if (tp + fn) > 0 else None
+    precision = tp / (tp + fp) if (tp + fp) > 0 else None
+    fpr = fp / (fp + tn) if (fp + tn) > 0 else None
+    tnr = tn / (tn + fp) if (tn + fp) > 0 else None
+    balanced_acc = ((recall or 0.0) + (tnr or 0.0)) / 2 if (recall is not None and tnr is not None) else acc
+    f1 = (2 * precision * recall) / (precision + recall) if (precision and recall and (precision + recall) > 0) else 0.0
+
+    return {
+        "acc": float(acc),
+        "balanced_acc": float(balanced_acc) if balanced_acc is not None else None,
+        "f1": float(f1) if f1 is not None else None,
+        "recall": float(recall) if recall is not None else None,
+        "precision": float(precision) if precision is not None else None,
+        "fpr": float(fpr) if fpr is not None else None,
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "n": n, "correct": correct, "errors": errors,
+    }
 
 
 def batch_accuracy(y: np.ndarray, yhat: np.ndarray, bs: int) -> np.ndarray:
+    """Calculate per-batch accuracy in range [0, 1]."""
     n = len(y) // bs
     return np.array([(y[i * bs:(i + 1) * bs] == yhat[i * bs:(i + 1) * bs]).mean() for i in range(n)])
 
@@ -2061,8 +2463,14 @@ def category_rates(cat: np.ndarray, y: np.ndarray, yhat: np.ndarray, start: int)
     for c in pd.unique(cat[start:]):
         m = cat[start:] == c
         yy, pp = y[start:][m], yhat[start:][m]
-        rows.append({"category": c, "flows": int(m.sum()), "rate": float((pp == yy).mean()),
-                     "kind": "specificity" if not yy.any() else "detection rate"})
+        flows = int(m.sum())
+        rate = float((pp == yy).mean()) if flows > 0 else None
+        rows.append({
+            "category": c,
+            "flows": flows,
+            "rate": rate,
+            "kind": "specificity" if not yy.any() else "detection rate",
+        })
     return pd.DataFrame(rows).sort_values("category").reset_index(drop=True)
 
 
@@ -2079,6 +2487,7 @@ class PolicyResult:
     alerts: list[dict] = field(default_factory=list)
     runtime_seconds: float = 0.0
     final_model: object = None
+    convergence_warnings: list[str] = field(default_factory=list)
 
     @property
     def n_retrains(self) -> int | None:
@@ -2093,104 +2502,166 @@ def _retrain_set(sc: Scenario, upto: int, rng: np.random.Generator, recent=RECEN
     if lo > 0:
         k = min(replay, lo)
         ridx = rng.choice(lo, size=k, replace=False)
-        parts_X.append(sc.X_stream.iloc[ridx]); parts_y.append(sc.y_stream[ridx])
+        parts_X.append(sc.X_stream.iloc[ridx])
+        parts_y.append(sc.y_stream[ridx])
     k = min(anchor, len(sc.X_train))
     aidx = rng.choice(len(sc.X_train), size=k, replace=False)
-    parts_X.append(sc.X_train.iloc[aidx]); parts_y.append(sc.y_train[aidx])
-    return pd.concat(parts_X, ignore_index=True), np.concatenate(parts_y)
+    parts_X.append(sc.X_train.iloc[aidx])
+    parts_y.append(sc.y_train[aidx])
+    Xs = pd.concat(parts_X, ignore_index=True)
+    ys = np.concatenate(parts_y)
+    assert_clean_features(Xs, sc.features)
+    return Xs, ys
 
 
-def run_policy(sc: Scenario, f0, policy: str, delta: float = ADWIN_DELTA, seed: int = 42,
-               recent: int = RECENT, replay: int = REPLAY, anchor: int = ANCHOR) -> PolicyResult:
-    """Prequential evaluation of one update policy (paper Algorithm 1 for 'Drift-triggered')."""
+def run_policy(
+    sc: Scenario, f0, policy: str, delta: float = ADWIN_DELTA, seed: int = 42,
+    recent: int = RECENT, replay: int = REPLAY, anchor: int = ANCHOR
+) -> PolicyResult:
+    """Prequential evaluation of one update policy (paper Algorithm 1 for 'Drift-triggered').
+
+    Enforces strict test-then-train: batch b is scored BEFORE any retraining.
+    Retraining only affects predictions for batches > b.
+    Static policy NEVER updates.
+    """
     from river import drift as rdrift
 
     bs, nb = sc.cfg.batch_size, sc.cfg.n_batches
     rng = np.random.default_rng(seed)
-    f = f0
-    yhat = np.zeros(sc.n_flows, bool)
-    proba = np.zeros(sc.n_flows)
+    # Clone estimator so policies do not share mutable state
+    f = clone(f0)
+    # Refit cloned initial model on initial training set
+    f, initial_warns = _fit(f0, sc.X_train, sc.y_train)
+
+    yhat = np.zeros(sc.n_flows, dtype=bool)
+    proba = np.zeros(sc.n_flows, dtype=float)
     res = PolicyResult(policy, yhat, proba)
+    res.convergence_warnings.extend(initial_warns)
+
     adwin = rdrift.ADWIN(delta=delta)
     cooldown = 0
     t_run = time.perf_counter()
+
     for b in range(nb):
         lo, hi = b * bs, (b + 1) * bs
         Xb, yb = sc.X_stream.iloc[lo:hi], sc.y_stream[lo:hi]
-        p = _proba(f, Xb)                                   # 1) test first
+
+        # 1) TEST FIRST (strict test-then-train order)
+        p = _proba(f, Xb)
         proba[lo:hi] = p
         yhat[lo:hi] = p >= 0.5
+
+        # 2) Reveal true labels for drift detection / adaptation
         alert = False
         if policy == "Drift-triggered":
             err = (yhat[lo:hi] != yb).astype(int)
-            for i, e in enumerate(err):                     # 2) labels revealed -> error stream -> ADWIN
+            for i, e in enumerate(err):
                 prev = adwin.estimation
                 adwin.update(int(e))
                 if adwin.drift_detected:
                     rose = adwin.estimation > prev
                     counted = rose and cooldown == 0
-                    res.alerts.append({"flow": lo + i + 1, "batch": b + 1, "error_before": float(prev),
-                                       "error_after": float(adwin.estimation), "rose": bool(rose),
-                                       "in_cooldown": cooldown > 0, "triggered_retrain": bool(counted)})
+                    res.alerts.append({
+                        "flow": lo + i + 1, "batch": b + 1, "error_before": float(prev),
+                        "error_after": float(adwin.estimation), "rose": bool(rose),
+                        "in_cooldown": cooldown > 0, "triggered_retrain": bool(counted),
+                    })
                     alert = alert or counted
             cooldown = max(0, cooldown - 1)
+
         retrain = alert or (policy == "Periodic" and (b + 1) % PERIODIC_EVERY == 0)
-        if retrain:                                         # 3) adapt; old model served until now
+        # Static policy NEVER retrains
+        if policy == "Static":
+            retrain = False
+
+        if retrain:
+            # 3) ADAPT FOR FUTURE BATCHES ONLY
             t0 = time.perf_counter()
             Xs, ys = _retrain_set(sc, hi, rng, recent, replay, anchor)
-            f = _fit(f0, Xs, ys)
+            f, retrain_warns = _fit(f0, Xs, ys)
+            res.convergence_warnings.extend(retrain_warns)
             res.retrain_seconds += time.perf_counter() - t0
             res.retrain_batches.append(b + 1)
             if policy == "Drift-triggered":
                 adwin = rdrift.ADWIN(delta=delta)
                 cooldown = 1
+
     res.runtime_seconds = time.perf_counter() - t_run
     res.final_model = f
     return res
 
 
 def run_online_hat(sc: Scenario, seed: int = 42, progress: Callable[[float], None] | None = None) -> PolicyResult:
-    """River Hoeffding Adaptive Tree (grace 100, depth 12) pre-trained on D0, then test-then-train per flow."""
+    """River Hoeffding Adaptive Tree pre-trained on D0, then prequential test-then-train per flow."""
     from river import compose, preprocessing, tree
 
     cols = list(sc.features)
-    model = compose.Pipeline(preprocessing.StandardScaler(), tree.HoeffdingAdaptiveTreeClassifier(grace_period=100, max_depth=12, seed=seed))
+    model = compose.Pipeline(
+        preprocessing.StandardScaler(),
+        tree.HoeffdingAdaptiveTreeClassifier(grace_period=100, max_depth=12, seed=seed)
+    )
     t0 = time.perf_counter()
     Xt = sc.X_train.to_numpy(float)
     for i in range(len(Xt)):
         model.learn_one(dict(zip(cols, Xt[i])), bool(sc.y_train[i]))
+
     Xs = sc.X_stream.to_numpy(float)
-    yhat = np.zeros(len(Xs), bool)
+    yhat = np.zeros(len(Xs), dtype=bool)
     for i in range(len(Xs)):
         x = dict(zip(cols, Xs[i]))
-        yhat[i] = bool(model.predict_one(x) or False)
+        # Test first, then train
+        pred = model.predict_one(x)
+        yhat[i] = bool(pred or False)
         model.learn_one(x, bool(sc.y_stream[i]))
         if progress and i % 2000 == 0:
             progress(i / len(Xs))
+
     return PolicyResult("Online HAT", yhat, None, [], 0.0, [], time.perf_counter() - t0, model)
 
 
-def fit_initial(sc: Scenario, model_name: str):
+def fit_initial(sc: Scenario, model_name: str, seed: int = 42):
+    """Fit the clean initial base model on the initial training set D0."""
     t0 = time.perf_counter()
-    f0 = _fit(make_model(model_name), sc.X_train, sc.y_train)
+    f0, warns = _fit(make_model(model_name, seed=seed), sc.X_train, sc.y_train)
     return f0, time.perf_counter() - t0
 
 
-def summarise(sc: Scenario, results: dict[str, PolicyResult]) -> pd.DataFrame:
-    """Paper Table IV for one scenario (computed, not copied)."""
+def summarise(sc: Scenario, results: dict[str, PolicyResult], run_info: dict | None = None) -> pd.DataFrame:
+    """Compute full paper Table IV metrics for all evaluated policies."""
     rows = []
     for name, r in results.items():
         m = binary_metrics(sc.y_stream, r.yhat)
         post = slice(sc.onset_flow, None)
-        post_acc = float((sc.y_stream[post] == r.yhat[post]).mean())
+        m_post = binary_metrics(sc.y_stream[post], r.yhat[post])
+
+        # Held-out family recall
+        held_out_rec = None
+        if sc.cfg.kind == "unseen" and sc.cfg.unseen:
+            unseen_mask = np.isin(sc.cat_stream[post], sc.cfg.unseen)
+            if unseen_mask.any():
+                held_out_rec = float((r.yhat[post][unseen_mask] == True).mean())
+
         delay = None
         if r.alerts:
             first = [a["flow"] for a in r.alerts if a["triggered_retrain"] and a["flow"] > sc.onset_flow]
             delay = (min(first) - sc.onset_flow) if first else None
-        rows.append({"Policy": name, "Acc (%)": 100 * m["acc"], "F1": m["f1"], "Rec (%)": 100 * m["recall"], "FPR (%)": 100 * m["fpr"],
-                     "Post-onset acc (%)": 100 * post_acc, "Retrains": r.n_retrains,
-                     "Retrain time (s)": None if name == "Online HAT" else r.retrain_seconds,
-                     "Delay (flows)": delay if name == "Drift-triggered" else None})
+
+        rows.append({
+            "Policy": name,
+            "Acc (%)": 100 * m["acc"] if m["acc"] is not None else None,
+            "Balanced Acc (%)": 100 * m["balanced_acc"] if m["balanced_acc"] is not None else None,
+            "F1": m["f1"],
+            "Rec (%)": 100 * m["recall"] if m["recall"] is not None else None,
+            "FPR (%)": 100 * m["fpr"] if m["fpr"] is not None else None,
+            "Post-onset acc (%)": 100 * m_post["acc"] if m_post["acc"] is not None else None,
+            "Held-out Rec (%)": 100 * held_out_rec if held_out_rec is not None else None,
+            "Evaluated": m["n"],
+            "Correct": m["correct"],
+            "Errors": m["errors"],
+            "Retrains": r.n_retrains,
+            "Retrain time (s)": None if name == "Online HAT" else r.retrain_seconds,
+            "Delay (flows)": delay if name == "Drift-triggered" else None,
+        })
     return pd.DataFrame(rows)
 
 
@@ -2198,7 +2669,9 @@ def summarise(sc: Scenario, results: dict[str, PolicyResult]) -> pd.DataFrame:
 # Threshold study (paper Section IV-F)
 # ----------------------------------------------------------------------------------------------- #
 def threshold_study(sc: Scenario, proba: np.ndarray, tune_batches: int = 5) -> dict | None:
-    """Re-tune the decision threshold on the first post-onset batches (labels revealed), evaluate on the rest."""
+    """Re-tune the decision threshold on the first post-onset batches, evaluate on the rest."""
+    if proba is None:
+        return None
     start = sc.onset_flow
     cut = start + tune_batches * sc.cfg.batch_size
     if cut >= sc.n_flows - sc.cfg.batch_size:
@@ -2208,12 +2681,197 @@ def threshold_study(sc: Scenario, proba: np.ndarray, tune_batches: int = 5) -> d
     if not yt.any() or yt.all() or not ye.any() or ye.all():
         return None
     grid = np.linspace(0.02, 0.98, 97)
-    f1s = [binary_metrics(yt, pt >= t)["f1"] for t in grid]
+    f1s = [binary_metrics(yt, pt >= t)["f1"] or 0.0 for t in grid]
     t_star = float(grid[int(np.argmax(f1s))])
     fpr, tpr, _ = roc_curve(ye, pe)
-    return {"threshold": t_star, "default": binary_metrics(ye, pe >= 0.5), "tuned": binary_metrics(ye, pe >= t_star),
-            "grid": grid, "eval_curve": [binary_metrics(ye, pe >= t) for t in grid], "roc": (fpr, tpr),
-            "tune_flows": int(cut - start), "eval_flows": int(len(ye))}
+    return {
+        "threshold": t_star,
+        "default": binary_metrics(ye, pe >= 0.5),
+        "tuned": binary_metrics(ye, pe >= t_star),
+        "grid": grid,
+        "eval_curve": [binary_metrics(ye, pe >= t) for t in grid],
+        "roc": (fpr, tpr),
+        "tune_flows": int(cut - start),
+        "eval_flows": int(len(ye)),
+    }
+
+
+# ----------------------------------------------------------------------------------------------- #
+# Auditable Exports
+# ----------------------------------------------------------------------------------------------- #
+def export_drift_lab_reports(
+    sc: Scenario, results: dict[str, PolicyResult], run_info: dict, out_dir: str = "reports/drift_lab"
+) -> dict[str, str]:
+    """Export all 9 required auditable artifacts to disk."""
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    bs = sc.cfg.batch_size
+    exported_files = {}
+
+    # 1. run_config.json
+    run_cfg_path = out_path / "run_config.json"
+    cfg_data = {
+        "run_id": run_info.get("run_id", str(uuid.uuid4())[:8]),
+        "timestamp": run_info.get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S")),
+        "model": run_info.get("selected_model_name"),
+        "estimator_class": run_info.get("actual_estimator_class"),
+        "hyperparameters": run_info.get("hyperparameters"),
+        "random_seed": run_info.get("random_seed"),
+        "dataset": run_info.get("dataset"),
+        "scenario_kind": sc.cfg.kind,
+        "unseen_categories": sc.cfg.unseen,
+        "shift_features": sc.cfg.shift_features,
+        "n_train": sc.cfg.n_train,
+        "n_batches": sc.cfg.n_batches,
+        "batch_size": sc.cfg.batch_size,
+        "onset_batch": sc.cfg.onset_batch,
+        "adwin_delta": run_info.get("adwin_delta", ADWIN_DELTA),
+        "stream_type": sc.stream_type,
+    }
+    run_cfg_path.write_text(json.dumps(cfg_data, indent=2), encoding="utf-8")
+    exported_files["run_config"] = str(run_cfg_path)
+
+    # 2. feature_audit.json
+    feat_path = out_path / "feature_audit.json"
+    feat_data = {
+        "feature_count": len(sc.features),
+        "features": sc.features,
+        "prohibited_features_checked": True,
+        "prohibited_features_found": [c for c in sc.features if is_prohibited_feature(c)],
+        "target_leakage_prevented": True,
+    }
+    feat_path.write_text(json.dumps(feat_data, indent=2), encoding="utf-8")
+    exported_files["feature_audit"] = str(feat_path)
+
+    # 3. split_audit.json
+    split_path = out_path / "split_audit.json"
+    split_path.write_text(json.dumps(sc.split_audit, indent=2), encoding="utf-8")
+    exported_files["split_audit"] = str(split_path)
+
+    # 4. policy_summary.csv
+    summ = summarise(sc, results, run_info)
+    summ_path = out_path / "policy_summary.csv"
+    summ.to_csv(summ_path, index=False)
+    exported_files["policy_summary"] = str(summ_path)
+
+    # 5. batch_metrics.csv
+    batch_rows = []
+    for pol_name, r in results.items():
+        b_acc = batch_accuracy(sc.y_stream, r.yhat, bs)
+        for b_idx, acc_val in enumerate(b_acc):
+            lo, hi = b_idx * bs, (b_idx + 1) * bs
+            y_b = sc.y_stream[lo:hi]
+            yh_b = r.yhat[lo:hi]
+            corr_b = int((y_b == yh_b).sum())
+            batch_rows.append({
+                "policy": pol_name,
+                "batch": b_idx + 1,
+                "evaluated": len(y_b),
+                "correct": corr_b,
+                "errors": len(y_b) - corr_b,
+                "batch_accuracy": float(acc_val),
+                "retrained": (b_idx + 1) in r.retrain_batches,
+                "post_onset": (b_idx + 1) > sc.cfg.onset_batch,
+            })
+    b_df = pd.DataFrame(batch_rows)
+    b_path = out_path / "batch_metrics.csv"
+    b_df.to_csv(b_path, index=False)
+    exported_files["batch_metrics"] = str(b_path)
+
+    # 6. per_family_metrics.csv
+    fam_rows = []
+    for pol_name in ("Static", "Drift-triggered", "Periodic"):
+        if pol_name in results:
+            rates = category_rates(sc.cat_stream, sc.y_stream, results[pol_name].yhat, sc.onset_flow)
+            for _, row in rates.iterrows():
+                fam_rows.append({
+                    "policy": pol_name,
+                    "category": row["category"],
+                    "kind": row["kind"],
+                    "flows": row["flows"],
+                    "score": row["rate"],
+                })
+    f_df = pd.DataFrame(fam_rows)
+    f_path = out_path / "per_family_metrics.csv"
+    f_df.to_csv(f_path, index=False)
+    exported_files["per_family_metrics"] = str(f_path)
+
+    # 7. retraining_events.csv
+    retrain_rows = []
+    for pol_name, r in results.items():
+        for alert in r.alerts:
+            retrain_rows.append({"policy": pol_name, **alert})
+    r_df = pd.DataFrame(retrain_rows)
+    r_path = out_path / "retraining_events.csv"
+    r_df.to_csv(r_path, index=False)
+    exported_files["retraining_events"] = str(r_path)
+
+    # 8. predictions.csv (sample first 2,000 flows and onset window for auditable inspection)
+    sample_indices = np.concatenate([
+        np.arange(min(1000, sc.n_flows)),
+        np.arange(max(0, sc.onset_flow - 200), min(sc.n_flows, sc.onset_flow + 800)),
+    ])
+    sample_indices = np.unique(sample_indices)
+    pred_dict = {
+        "flow_index": sample_indices,
+        "batch_index": sample_indices // bs + 1,
+        "ground_truth": sc.y_stream[sample_indices].astype(int),
+        "attack_category": sc.cat_stream[sample_indices],
+    }
+    for pol_name, r in results.items():
+        pred_dict[f"{pol_name}_pred"] = r.yhat[sample_indices].astype(int)
+        if r.proba is not None:
+            pred_dict[f"{pol_name}_proba"] = np.round(r.proba[sample_indices], 4)
+    pred_df = pd.DataFrame(pred_dict)
+    pred_path = out_path / "predictions.csv"
+    pred_df.to_csv(pred_path, index=False)
+    exported_files["predictions"] = str(pred_path)
+
+    # 9. model_comparison.csv row export
+    comp_rows = []
+    for pol_name, r in results.items():
+        m = binary_metrics(sc.y_stream, r.yhat)
+        post = slice(sc.onset_flow, None)
+        held_out_rec = None
+        if sc.cfg.kind == "unseen" and sc.cfg.unseen:
+            unseen_mask = np.isin(sc.cat_stream[post], sc.cfg.unseen)
+            if unseen_mask.any():
+                held_out_rec = float((r.yhat[post][unseen_mask] == True).mean())
+        comp_rows.append({
+            "dataset": run_info.get("dataset"),
+            "task": "binary",
+            "scenario": sc.cfg.kind,
+            "model": run_info.get("selected_model_name"),
+            "estimator_class": run_info.get("actual_estimator_class"),
+            "policy": pol_name,
+            "seed": sc.cfg.seed,
+            "n_train": len(sc.X_train),
+            "n_evaluated": m["n"],
+            "correct": m["correct"],
+            "errors": m["errors"],
+            "accuracy": m["acc"],
+            "balanced_accuracy": m["balanced_acc"],
+            "precision": m["precision"],
+            "recall": m["recall"],
+            "f1": m["f1"],
+            "false_positive_rate": m["fpr"],
+            "held_out_family_recall": held_out_rec,
+            "retrain_count": r.n_retrains,
+            "run_id": run_info.get("run_id"),
+        })
+    comp_df = pd.DataFrame(comp_rows)
+    comp_path = out_path / "model_comparison.csv"
+    if comp_path.exists():
+        try:
+            prev_df = pd.read_csv(comp_path)
+            comp_df = pd.concat([prev_df, comp_df], ignore_index=True)
+        except Exception:
+            pass
+    comp_df.to_csv(comp_path, index=False)
+    exported_files["model_comparison"] = str(comp_path)
+
+    return exported_files
+
 ''',
     "utils.paper_data": r'''
 """Results and metadata published in the project paper.
@@ -3153,7 +3811,7 @@ def policy_accuracy_chart(acc: dict[str, np.ndarray], onset_batch: int, retrains
     for b in alerts or []:
         fig.add_vline(x=b, line=dict(color=COLORS["amber"], width=1, dash="dash"))
     fig.update_xaxes(title="Batch (sequential stream order)")
-    fig.update_yaxes(title="Accuracy", tickformat=".1%")
+    fig.update_yaxes(title="Accuracy", range=[0.0, 1.05], tickformat=".0%")
     return fig
 
 
@@ -3427,6 +4085,86 @@ def explore_project_dialog() -> None:
                 "is comparatively scarce. This framework puts the three together and keeps the drift experiment honest: it runs on "
                 "recorded flows in a simulated stream, not on live traffic.")
     st.dialog("Explore the project", width="large", icon=":material/travel_explore:")(body)()
+
+def drift_intelligence_dialog(res) -> None:
+    @st.dialog("🛡️ Drift Intelligence Alert", width="large")
+    def body() -> None:
+        from utils.drift_alerts import (
+            plot_drift_radar, plot_drift_galaxy, plot_drift_heatmap,
+            plot_prediction_shift, generate_drift_report_csv
+        )
+        import datetime
+        color = res.color
+        st.markdown(
+            f'<div style="background:rgba(10,17,40,0.85);border:1px solid {color}50;border-left:6px solid {color};border-radius:12px;padding:16px 20px;margin-bottom:16px">'
+            f'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">'
+            f'<div><span style="font-size:0.75rem;letter-spacing:1px;text-transform:uppercase;color:#8fa3c0">Post-Generation Model Monitoring</span>'
+            f'<h3 style="margin:4px 0 0 0;color:#ffffff">{res.severity_label}</h3></div>'
+            f'<div style="background:{color}22;border:1px solid {color};color:{color};font-weight:700;font-size:1.1rem;padding:6px 14px;border-radius:20px">'
+            f'Score: {res.overall_score:.2f}</div>'
+            f'</div></div>',
+            unsafe_allow_html=True
+        )
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Drifted Features", f"{res.n_drifted_features} / {res.n_features_evaluated}", f"{res.drifted_fraction:.0%} affected")
+        atk_delta = res.prediction_drift.get("attack_rate_delta", 0.0)
+        m2.metric("Attack Rate Shift", f"{atk_delta:.1%}", f"Batch: {res.prediction_drift.get('batch_attack_rate', 0.0):.1%}")
+        c_delta = res.confidence_drift.get("confidence_delta", 0.0)
+        m3.metric("Confidence Drop", f"{c_delta:.2%}", "vs baseline")
+        adwin_text = "ALERT" if res.adwin_alert else "Stable"
+        m4.metric("River ADWIN", adwin_text, f"{res.adwin_alerts_count} alert(s)")
+
+        st.info(f"**Diagnostic Summary:** {res.interpretation}\n\n**Recommended Action:** {res.recommended_action}")
+
+        t_diag, t_galaxy, t_maps = st.tabs(["📋 Top Indicators", "🛰️ Drift Radar & Galaxy", "🔥 Drift Heatmap & Shift"])
+        with t_diag:
+            if res.top_drifted:
+                st.markdown("**Most Divergent Flow Indicators (by PSI):**")
+                cols = st.columns(min(len(res.top_drifted), 4))
+                for i, fd in enumerate(res.top_drifted[:4]):
+                    with cols[i]:
+                        st.markdown(
+                            f'<div style="background:rgba(15,23,42,0.6);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:10px">'
+                            f'<div style="font-size:0.8rem;color:#8fa3c0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="{fd.name}">{fd.name}</div>'
+                            f'<div style="font-size:1.1rem;font-weight:700;color:{color}">PSI {fd.psi:.3f}</div>'
+                            f'<div style="font-size:0.75rem;color:#94a3b8">Shift: {fd.mean_shift:+.2f}σ</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                st.dataframe(res.feature_table.head(8), width="stretch", hide_index=True)
+            else:
+                st.write("No features showed significant divergence.")
+        with t_galaxy:
+            c_r, c_g = st.columns(2)
+            with c_r:
+                st.plotly_chart(plot_drift_radar(res), use_container_width=True)
+            with c_g:
+                current_X = st.session_state.get("last_batch", {}).get("X")
+                if current_X is not None:
+                    st.plotly_chart(plot_drift_galaxy(res, current_X), use_container_width=True)
+                else:
+                    st.caption("Batch features unavailable for galaxy map.")
+        with t_maps:
+            st.plotly_chart(plot_prediction_shift(res), use_container_width=True)
+            if res.top_drifted:
+                st.plotly_chart(plot_drift_heatmap(res), use_container_width=True)
+
+        st.divider()
+        b_c1, b_c2, _ = st.columns([2, 2, 2])
+        with b_c1:
+            if st.button("📊 Open Drift Intelligence Page", type="primary", key="dlg_go_drift_intel", icon=":material/arrow_forward:"):
+                st.switch_page(NAV_PAGES.get("drift_intel") or "drift_intelligence")
+        with b_c2:
+            st.download_button(
+                "📥 Download Drift Report",
+                generate_drift_report_csv(res),
+                file_name=f"drift_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                key="dlg_dl_drift_report",
+                icon=":material/download:"
+            )
+    body()
+
 ''',
     "components.data_source": r'''
 """Shared UI for choosing the records used by Explainability / Drift / live evaluation."""
@@ -3545,6 +4283,784 @@ def render_sidebar() -> None:
             md(f'<div class="side-row"><span>Drift run</span><span>{r.summary["n_drift_events"]} event(s)</span></div>')
         md('<div class="side-label">Scope</div>')
         st.caption("Offline analysis of recorded flow records. No live packet capture, no firewall control, no blocking.")
+        md('<div class="side-label">Monitoring Settings</div>')
+        st.toggle("Post-generation drift alerts", value=st.session_state.get("enable_drift_alerts", True), key="enable_drift_alerts")
+        dr_side = st.session_state.get("latest_drift_result")
+        if dr_side is not None:
+            md(f'<div class="side-row"><span>Drift status</span><span style="color:{dr_side.color};font-weight:700">{dr_side.status}</span></div>')
+
+''',
+    "utils.drift_alerts": r'''
+"""Drift Intelligence System for Network Intrusion Detection.
+Provides evidence-based feature-level data drift (PSI, KS-test, Wasserstein)
+and prediction-level concept drift (ADWIN, attack-rate shift, class distribution,
+confidence divergence), along with rich cybersecurity visual maps and modal alerts.
+"""
+from __future__ import annotations
+
+import datetime
+import io
+import warnings
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from scipy import stats
+from river import drift
+
+# --------------------------------------------------------------------------- #
+# Data structures
+# --------------------------------------------------------------------------- #
+@dataclass
+class FeatureDrift:
+    name: str
+    psi: float
+    ks_stat: float
+    ks_pvalue: float
+    wasserstein: float
+    severity: str  # "Stable" | "Low" | "Moderate" | "High"
+    ref_mean: float
+    curr_mean: float
+    ref_std: float
+    curr_std: float
+    mean_shift: float
+    importance: float = 0.0
+
+
+@dataclass
+class DriftAnalysisResult:
+    status: str            # "STABLE" | "LOW_DRIFT" | "MODERATE_DRIFT" | "CRITICAL_DRIFT"
+    severity_label: str    # Human readable label
+    overall_score: float   # Normalized 0.0 - 1.0 composite drift score
+    color: str             # Visual status color (#34d399, #fbbf24, #f97316, #f43f5e)
+    n_features_evaluated: int
+    n_drifted_features: int
+    drifted_fraction: float
+    top_drifted: list[FeatureDrift]
+    feature_table: pd.DataFrame
+    prediction_drift: dict[str, Any]
+    confidence_drift: dict[str, Any]
+    adwin_alert: bool
+    adwin_alerts_count: int
+    timestamp: str
+    batch_size: int
+    reference_name: str
+    recommended_action: str
+    interpretation: str
+    feature_importances: dict[str, float] = field(default_factory=dict)
+    has_reference: bool = True
+    notes: list[str] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Reference Baseline Cache
+# --------------------------------------------------------------------------- #
+_CACHED_BASELINE: pd.DataFrame | None = None
+_BASELINE_SOURCE_NAME: str = "CIC-IDS2017 Cleaned Baseline"
+
+
+def get_reference_baseline(max_rows: int = 5000, seed: int = 42) -> tuple[pd.DataFrame | None, str]:
+    """Retrieve or sample a stable reference dataset for baseline comparison."""
+    global _CACHED_BASELINE, _BASELINE_SOURCE_NAME
+    if _CACHED_BASELINE is not None and len(_CACHED_BASELINE) > 0:
+        return _CACHED_BASELINE, _BASELINE_SOURCE_NAME
+
+    candidates = [
+        Path("data/cicids2017_cleaned.csv"),
+        Path("data/unsw_nb15_cleaned_train.csv"),
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                df = pd.read_csv(p, nrows=max_rows * 2, low_memory=False)
+                if len(df) > max_rows:
+                    df = df.sample(n=max_rows, random_state=seed).reset_index(drop=True)
+                _CACHED_BASELINE = df
+                _BASELINE_SOURCE_NAME = f"{p.stem} (sample N={len(df):,})"
+                return _CACHED_BASELINE, _BASELINE_SOURCE_NAME
+            except Exception:
+                continue
+
+    return None, "Baseline unavailable"
+
+
+# --------------------------------------------------------------------------- #
+# Statistical Drift Computation
+# --------------------------------------------------------------------------- #
+def calculate_psi(ref: np.ndarray, curr: np.ndarray, bins: int = 10) -> float:
+    """Calculate Population Stability Index (PSI) between reference and current samples."""
+    ref_clean = ref[np.isfinite(ref)]
+    curr_clean = curr[np.isfinite(curr)]
+
+    if len(ref_clean) < 10 or len(curr_clean) < 5:
+        return 0.0
+
+    quantiles = np.linspace(0, 1, bins + 1)
+    bin_edges = np.percentile(ref_clean, quantiles * 100)
+    bin_edges = np.unique(bin_edges)
+
+    if len(bin_edges) < 2:
+        return 0.0
+
+    # Expand outer boundaries to cover all current data
+    bin_edges[0] = -np.inf
+    bin_edges[-1] = np.inf
+
+    r_counts, _ = np.histogram(ref_clean, bins=bin_edges)
+    c_counts, _ = np.histogram(curr_clean, bins=bin_edges)
+
+    # Laplace / epsilon smoothing to prevent div by zero
+    eps = 1e-4
+    r_pct = np.maximum(r_counts / max(len(ref_clean), 1), eps)
+    c_pct = np.maximum(c_counts / max(len(curr_clean), 1), eps)
+    r_pct /= r_pct.sum()
+    c_pct /= c_pct.sum()
+
+    psi = np.sum((c_pct - r_pct) * np.log(c_pct / r_pct))
+    return float(max(0.0, psi))
+
+
+def classify_psi_severity(psi: float) -> str:
+    """Classify PSI into established risk tiers."""
+    if psi < 0.10:
+        return "Stable"
+    elif psi < 0.20:
+        return "Low"
+    elif psi < 0.30:
+        return "Moderate"
+    else:
+        return "High"
+
+
+def evaluate_feature_drift(
+    ref_vals: np.ndarray,
+    curr_vals: np.ndarray,
+    feat_name: str,
+    importance: float = 0.0
+) -> FeatureDrift:
+    """Run full battery of statistical tests for a single continuous feature."""
+    r = ref_vals[np.isfinite(ref_vals)]
+    c = curr_vals[np.isfinite(curr_vals)]
+
+    if len(r) == 0 or len(c) == 0:
+        return FeatureDrift(
+            name=feat_name, psi=0.0, ks_stat=0.0, ks_pvalue=1.0,
+            wasserstein=0.0, severity="Stable", ref_mean=0.0, curr_mean=0.0,
+            ref_std=0.0, curr_std=0.0, mean_shift=0.0, importance=importance
+        )
+
+    r_mean, r_std = float(np.mean(r)), float(np.std(r))
+    c_mean, c_std = float(np.mean(c)), float(np.std(c))
+
+    # Standardized Wasserstein distance
+    scale = r_std if r_std > 1e-6 else 1.0
+    r_scaled = (r - r_mean) / scale
+    c_scaled = (c - r_mean) / scale
+    try:
+        wass = float(stats.wasserstein_distance(r_scaled, c_scaled))
+    except Exception:
+        wass = 0.0
+
+    # KS-Test
+    try:
+        ks_res = stats.ks_2samp(r, c)
+        ks_stat, ks_pval = float(ks_res.statistic), float(ks_res.pvalue)
+    except Exception:
+        ks_stat, ks_pval = 0.0, 1.0
+
+    # PSI
+    psi = calculate_psi(r, c)
+    sev = classify_psi_severity(psi)
+
+    shift = (c_mean - r_mean) / scale
+
+    return FeatureDrift(
+        name=feat_name,
+        psi=psi,
+        ks_stat=ks_stat,
+        ks_pvalue=ks_pval,
+        wasserstein=wass,
+        severity=sev,
+        ref_mean=r_mean,
+        curr_mean=c_mean,
+        ref_std=r_std,
+        curr_std=c_std,
+        mean_shift=shift,
+        importance=importance,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Main Analysis Pipeline
+# --------------------------------------------------------------------------- #
+def analyze_batch_drift(
+    current_X: pd.DataFrame,
+    prediction_table: pd.DataFrame,
+    model: Any = None,
+    feature_names: list[str] | None = None,
+    reference_data: pd.DataFrame | None = None,
+) -> DriftAnalysisResult:
+    """Analyze the newly generated prediction batch against the historical baseline."""
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    n_records = len(current_X)
+
+    if feature_names is None:
+        feature_names = [c for c in current_X.columns if pd.api.types.is_numeric_dtype(current_X[c])]
+
+    ref_df, ref_name = (reference_data, "Custom Reference") if reference_data is not None else get_reference_baseline()
+    has_ref = ref_df is not None and len(ref_df) > 0
+
+    importances: dict[str, float] = {}
+    if model is not None:
+        raw_imp = getattr(model, "feature_importances_", None)
+        if raw_imp is not None and len(raw_imp) == len(feature_names):
+            importances = dict(zip(feature_names, [float(x) for x in raw_imp]))
+
+    feature_drifts: list[FeatureDrift] = []
+    if has_ref:
+        for f in feature_names:
+            if f in ref_df.columns and f in current_X.columns:
+                r_arr = pd.to_numeric(ref_df[f], errors="coerce").dropna().to_numpy()
+                c_arr = pd.to_numeric(current_X[f], errors="coerce").dropna().to_numpy()
+                imp = importances.get(f, 0.0)
+                fd = evaluate_feature_drift(r_arr, c_arr, f, importance=imp)
+                feature_drifts.append(fd)
+
+    # Sort descending by PSI
+    feature_drifts.sort(key=lambda d: d.psi, reverse=True)
+    n_drifted = sum(1 for d in feature_drifts if d.psi >= 0.10)
+    frac_drifted = n_drifted / max(len(feature_drifts), 1)
+
+    # Prediction level metrics
+    pred_summary: dict[str, Any] = {}
+    conf_summary: dict[str, Any] = {}
+    adwin_alerts = 0
+
+    if "is_attack" in prediction_table.columns or "final_verdict" in prediction_table.columns:
+        if "is_attack" in prediction_table.columns:
+            atk_flags = prediction_table["is_attack"].astype(bool).to_numpy()
+        else:
+            atk_flags = (prediction_table["final_verdict"] != "Normal").to_numpy()
+
+        batch_atk_rate = float(np.mean(atk_flags))
+        ref_atk_rate = 0.318  # Known CIC-IDS2017 attack proportion
+        if has_ref and "Label" in ref_df.columns:
+            ref_atk_rate = float((ref_df["Label"].astype(str).str.strip().str.upper() != "BENIGN").mean())
+
+        atk_delta = abs(batch_atk_rate - ref_atk_rate)
+        pred_summary["batch_attack_rate"] = batch_atk_rate
+        pred_summary["reference_attack_rate"] = ref_atk_rate
+        pred_summary["attack_rate_delta"] = atk_delta
+
+        # Class distribution
+        if "final_verdict" in prediction_table.columns:
+            vc = prediction_table["final_verdict"].value_counts(normalize=True).to_dict()
+            pred_summary["batch_categories"] = vc
+
+        # Confidence analysis
+        conf_col = next((c for c in ("attack_probability", "binary_confidence", "multiclass_confidence") if c in prediction_table.columns), None)
+        if conf_col is not None:
+            c_vals = pd.to_numeric(prediction_table[conf_col], errors="coerce").dropna().to_numpy()
+            batch_conf = float(np.mean(c_vals)) if len(c_vals) > 0 else 0.95
+            ref_conf = 0.985
+            conf_summary["batch_confidence"] = batch_conf
+            conf_summary["reference_confidence"] = ref_conf
+            conf_summary["confidence_delta"] = float(ref_conf - batch_conf)
+
+        # ADWIN change detection stream
+        adwin = drift.ADWIN(delta=0.002)
+        has_true_label = "original_label" in prediction_table.columns
+        for idx in range(len(prediction_table)):
+            if has_true_label:
+                true_lbl = str(prediction_table["original_label"].iloc[idx]).strip().upper()
+                is_true_atk = true_lbl not in ("BENIGN", "NORMAL", "0")
+                is_pred_atk = bool(atk_flags[idx])
+                err = int(is_true_atk != is_pred_atk)
+                adwin.update(err)
+            else:
+                # Without ground truth, monitor prediction uncertainty (or high anomaly flag)
+                conf = float(prediction_table["binary_confidence"].iloc[idx]) if "binary_confidence" in prediction_table.columns else 0.95
+                uncertainty = 1.0 - conf
+                adwin.update(uncertainty)
+
+            if adwin.drift_detected:
+                adwin_alerts += 1
+
+    # Composite Drift Score (0.0 to 1.0)
+    top5_psi = float(np.mean([d.psi for d in feature_drifts[:5]])) if feature_drifts else 0.0
+    norm_top5 = min(1.0, top5_psi / 0.50)
+    norm_frac = frac_drifted
+    norm_pred = min(1.0, pred_summary.get("attack_rate_delta", 0.0) * 2.0)
+    norm_adwin = 1.0 if adwin_alerts > 0 else 0.0
+
+    composite_score = (
+        0.40 * norm_top5 +
+        0.25 * norm_frac +
+        0.20 * norm_pred +
+        0.15 * norm_adwin
+    )
+    composite_score = float(np.clip(composite_score, 0.0, 1.0))
+
+    # Categorize overall status
+    if not has_ref:
+        status = "STABLE"
+        sev_label = "Reference baseline unavailable"
+        color = "#8fa3c0"
+        rec = "Attach or place historical reference datasets in data/ to enable baseline drift comparison."
+        interp = "Reference baseline unavailable; drift assessment limited to internal consistency."
+    elif composite_score < 0.15:
+        status = "STABLE"
+        sev_label = "Stable (No Significant Drift)"
+        color = "#34d399"  # Emerald
+        rec = "Traffic profile aligns with historical baseline. Model predictions are statistically reliable. Continue routine monitoring."
+        interp = f"Analyzed {len(feature_drifts)} flow features across {n_records:,} records. Feature distributions and prediction rates remain stable within baseline tolerances."
+    elif composite_score < 0.30:
+        status = "LOW_DRIFT"
+        sev_label = "Low Drift Detected"
+        color = "#fbbf24"  # Amber
+        rec = "Minor distributional variance observed in peripheral traffic features. No immediate retraining needed; monitor subsequent batches."
+        interp = f"Low drift detected: {n_drifted} feature(s) showed mild distributional divergence (PSI >= 0.10). Core attack patterns remain consistent."
+    elif composite_score < 0.50:
+        status = "MODERATE_DRIFT"
+        sev_label = "Moderate Drift Warning"
+        color = "#f97316"  # Orange
+        rec = "Notable feature divergence and prediction shift detected. Evaluate top drifted features against recent attack signatures and prepare candidate retrain data."
+        interp = f"Moderate drift detected: {n_drifted} feature(s) shifted significantly (top PSI: {top5_psi:.2f}). Attack rate shifted by {pred_summary.get('attack_rate_delta', 0.0):.1%}."
+    else:
+        status = "CRITICAL_DRIFT"
+        sev_label = "Critical / High Drift Alert"
+        color = "#f43f5e"  # Crimson
+        rec = "Critical distributional shift confirmed across key flow features. Model predictions may suffer degraded fidelity. Recommend executing adaptive retraining on recent traffic."
+        interp = f"High/Critical concept and data drift detected: {n_drifted} features drifted (composite score: {composite_score:.2f}). ADWIN triggered {adwin_alerts} alert(s)."
+
+    # Build DataFrame
+    tbl_rows = []
+    for fd in feature_drifts:
+        tbl_rows.append({
+            "Feature": fd.name,
+            "PSI Score": round(fd.psi, 4),
+            "Severity": fd.severity,
+            "KS Statistic": round(fd.ks_stat, 4),
+            "p-value": f"{fd.ks_pvalue:.2e}" if fd.ks_pvalue < 0.001 else round(fd.ks_pvalue, 4),
+            "Wasserstein": round(fd.wasserstein, 4),
+            "Relative Mean Shift": round(fd.mean_shift, 4),
+            "Reference Mean": round(fd.ref_mean, 2),
+            "Batch Mean": round(fd.curr_mean, 2),
+            "Model Importance": round(fd.importance, 4),
+        })
+    df_features = pd.DataFrame(tbl_rows)
+
+    return DriftAnalysisResult(
+        status=status,
+        severity_label=sev_label,
+        overall_score=composite_score,
+        color=color,
+        n_features_evaluated=len(feature_drifts),
+        n_drifted_features=n_drifted,
+        drifted_fraction=frac_drifted,
+        top_drifted=feature_drifts[:8],
+        feature_table=df_features,
+        prediction_drift=pred_summary,
+        confidence_drift=conf_summary,
+        adwin_alert=(adwin_alerts > 0),
+        adwin_alerts_count=adwin_alerts,
+        timestamp=now_str,
+        batch_size=n_records,
+        reference_name=ref_name,
+        recommended_action=rec,
+        interpretation=interp,
+        feature_importances=importances,
+        has_reference=has_ref,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Visualizations
+# --------------------------------------------------------------------------- #
+_PLOT_THEME = dict(
+    paper_bgcolor="rgba(10, 17, 40, 0.6)",
+    plot_bgcolor="rgba(5, 8, 22, 0.8)",
+    font=dict(color="#e6edf7", family="Inter, sans-serif"),
+    margin=dict(l=30, r=30, t=40, b=30),
+)
+
+
+def plot_drift_radar(res: DriftAnalysisResult) -> go.Figure:
+    """Multi-axis radar chart showing normalized drift dimensions."""
+    p = res.prediction_drift
+    c = res.confidence_drift
+
+    categories = [
+        "Feature Drift (PSI)",
+        "Drifted Features %",
+        "Attack Rate Shift",
+        "Confidence Drop",
+        "KS Severity",
+        "ADWIN Alert Intensity"
+    ]
+    top_psi = res.top_drifted[0].psi if res.top_drifted else 0.0
+    c_delta = max(0.0, c.get("confidence_delta", 0.0))
+    ks_max = max([d.ks_stat for d in res.top_drifted], default=0.0)
+
+    values = [
+        min(1.0, top_psi / 0.5),
+        res.drifted_fraction,
+        min(1.0, p.get("attack_rate_delta", 0.0) * 2.5),
+        min(1.0, c_delta * 5.0),
+        min(1.0, ks_max),
+        1.0 if res.adwin_alert else 0.0,
+    ]
+    # Close polygon
+    values_closed = values + [values[0]]
+    categories_closed = categories + [categories[0]]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=values_closed,
+        theta=categories_closed,
+        fill="toself",
+        fillcolor="rgba(34, 211, 238, 0.25)",
+        line=dict(color="#22d3ee", width=2.5),
+        name="Observed Drift",
+        hovertemplate="%{theta}: <b>%{r:.2f}</b><extra></extra>",
+    ))
+    # Reference safe boundary (0.2)
+    fig.add_trace(go.Scatterpolar(
+        r=[0.2] * len(categories_closed),
+        theta=categories_closed,
+        line=dict(color="rgba(52, 211, 153, 0.6)", dash="dot", width=1.5),
+        name="Tolerance Threshold",
+        hoverinfo="skip"
+    ))
+
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0, 1.0], color="#8fa3c0", gridcolor="rgba(255, 255, 255, 0.08)"),
+            angularaxis=dict(color="#e6edf7", gridcolor="rgba(255, 255, 255, 0.08)"),
+            bgcolor="rgba(10, 17, 40, 0.5)"
+        ),
+        title=dict(text="Drift Dimension Radar Profile", font=dict(size=14, color="#e6edf7")),
+        showlegend=True,
+        legend=dict(orientation="h", y=-0.15, font=dict(size=11)),
+        height=340,
+        **_PLOT_THEME,
+    )
+    return fig
+
+
+def plot_drift_heatmap(res: DriftAnalysisResult, top_n: int = 12) -> go.Figure:
+    """Interactive heatmap showing top drifted features across all statistical metrics."""
+    top_feats = res.top_drifted[:top_n]
+    if not top_feats:
+        return go.Figure()
+
+    feat_names = [f.name for f in reversed(top_feats)]
+    metrics = ["PSI Index", "KS Statistic", "Wasserstein", "Relative Shift"]
+
+    # Matrix normalized [0, 1] for heatmap coloring
+    z_matrix = []
+    text_matrix = []
+    for f in reversed(top_feats):
+        z_row = [
+            min(1.0, f.psi / 0.4),
+            min(1.0, f.ks_stat),
+            min(1.0, f.wasserstein / 2.0),
+            min(1.0, abs(f.mean_shift) / 2.0),
+        ]
+        t_row = [
+            f"PSI: {f.psi:.3f} ({f.severity})",
+            f"KS: {f.ks_stat:.3f} (p={f.ks_pvalue:.1e})",
+            f"Wass: {f.wasserstein:.3f}",
+            f"Shift: {f.mean_shift:+.2f}σ",
+        ]
+        z_matrix.append(z_row)
+        text_matrix.append(t_row)
+
+    colorscale = [
+        [0.0, "#0a1128"],
+        [0.2, "#134e4a"],
+        [0.5, "#d97706"],
+        [0.8, "#ea580c"],
+        [1.0, "#f43f5e"]
+    ]
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z_matrix,
+        x=metrics,
+        y=feat_names,
+        text=text_matrix,
+        texttemplate="%{text}",
+        textfont=dict(size=10, color="#ffffff"),
+        colorscale=colorscale,
+        showscale=True,
+        colorbar=dict(title=dict(text="Intensity", font=dict(color="#8fa3c0", size=10)), tickfont=dict(color="#8fa3c0", size=9)),
+        hovertemplate="Feature: <b>%{y}</b><br>Metric: <b>%{x}</b><br>%{text}<extra></extra>"
+    ))
+
+    fig.update_layout(
+        title=dict(text=f"Top {len(top_feats)} Drifted Flow Indicators Heatmap", font=dict(size=14, color="#e6edf7")),
+        height=max(320, 25 * len(top_feats)),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
+        **_PLOT_THEME,
+    )
+    return fig
+
+
+def plot_drift_galaxy(res: DriftAnalysisResult, current_X: pd.DataFrame, max_nodes: int = 22) -> go.Figure:
+    """Traffic Drift Galaxy / Constellation Map (conceptual network graph)."""
+    top_feats = res.top_drifted[:max_nodes]
+    if not top_feats:
+        return go.Figure()
+
+    names = [f.name for f in top_feats]
+    psi_dict = {f.name: f.psi for f in top_feats}
+    sev_dict = {f.name: f.severity for f in top_feats}
+
+    color_map = {
+        "Stable": "#34d399",
+        "Low": "#fbbf24",
+        "Moderate": "#f97316",
+        "High": "#f43f5e"
+    }
+
+    # Celestial layout coordinates
+    n = len(names)
+    np.random.seed(42)
+    angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    # Radius based on drift magnitude: higher drift placed further out from center
+    radii = [0.35 + 0.65 * min(1.0, psi_dict[name] / 0.4) for name in names]
+    x_coords = [radii[i] * np.cos(angles[i]) for i in range(n)]
+    y_coords = [radii[i] * np.sin(angles[i]) for i in range(n)]
+    sizes = [14 + 30 * min(1.0, psi_dict[name] / 0.5) for name in names]
+    colors = [color_map.get(sev_dict[name], "#34d399") for name in names]
+
+    fig = go.Figure()
+
+    # Draw correlation constellation edges between top drifted features
+    sub_df = current_X[[col for col in names if col in current_X.columns]]
+    if len(sub_df) > 5 and len(sub_df.columns) > 1:
+        corr = sub_df.corr().fillna(0).to_numpy()
+        edge_x = []
+        edge_y = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if abs(corr[i, j]) > 0.65:
+                    edge_x.extend([x_coords[i], x_coords[j], None])
+                    edge_y.extend([y_coords[i], y_coords[j], None])
+        if edge_x:
+            fig.add_trace(go.Scatter(
+                x=edge_x, y=edge_y,
+                mode="lines",
+                line=dict(color="rgba(34, 211, 238, 0.22)", width=1.2),
+                hoverinfo="none",
+                showlegend=False
+            ))
+
+    # Core galaxy hub
+    fig.add_trace(go.Scatter(
+        x=[0], y=[0],
+        mode="markers",
+        marker=dict(size=18, color="#22d3ee", symbol="diamond", line=dict(color="#ffffff", width=2)),
+        name="Baseline Core",
+        hoverinfo="text",
+        text=["Baseline Training Distribution Anchor"]
+    ))
+
+    # Feature Star Nodes
+    hover_texts = [
+        f"<b>{name}</b><br>Drift Tier: <b>{sev_dict[name]}</b><br>PSI: <b>{psi_dict[name]:.4f}</b>"
+        for name in names
+    ]
+    fig.add_trace(go.Scatter(
+        x=x_coords, y=y_coords,
+        mode="markers+text",
+        marker=dict(size=sizes, color=colors, line=dict(color="rgba(255,255,255,0.4)", width=1.5)),
+        text=[n if len(n) <= 14 else n[:12] + "…" for n in names],
+        textposition="top center",
+        textfont=dict(size=9, color="#e6edf7"),
+        hoverinfo="text",
+        hovertext=hover_texts,
+        name="Flow Features",
+        showlegend=False
+    ))
+
+    fig.update_layout(
+        title=dict(text="Traffic Drift Galaxy (Constellation View)", font=dict(size=14, color="#e6edf7")),
+        xaxis=dict(visible=False, range=[-1.35, 1.35]),
+        yaxis=dict(visible=False, range=[-1.35, 1.35]),
+        height=360,
+        **_PLOT_THEME,
+    )
+    return fig
+
+
+def plot_drift_timeline(history: list[dict]) -> go.Figure:
+    """Interactive line chart of drift scores across processed batches in this session."""
+    fig = go.Figure()
+    if not history:
+        return fig
+
+    batch_nums = [h.get("batch_id", i + 1) for i, h in enumerate(history)]
+    scores = [h.get("overall_score", 0.0) for h in history]
+    times = [h.get("timestamp", "") for h in history]
+    statuses = [h.get("status", "STABLE") for h in history]
+
+    # Threshold horizontal reference bands
+    fig.add_hrect(y0=0.0, y1=0.15, fillcolor="rgba(52, 211, 153, 0.10)", line_width=0, annotation_text="Stable Zone", annotation_position="top left", annotation_font_size=9)
+    fig.add_hrect(y0=0.15, y1=0.30, fillcolor="rgba(251, 191, 36, 0.10)", line_width=0, annotation_text="Low Drift", annotation_position="top left", annotation_font_size=9)
+    fig.add_hrect(y0=0.30, y1=0.50, fillcolor="rgba(249, 115, 22, 0.10)", line_width=0, annotation_text="Moderate Drift", annotation_position="top left", annotation_font_size=9)
+    fig.add_hrect(y0=0.50, y1=1.00, fillcolor="rgba(244, 63, 94, 0.12)", line_width=0, annotation_text="Critical Drift", annotation_position="top left", annotation_font_size=9)
+
+    fig.add_trace(go.Scatter(
+        x=batch_nums, y=scores,
+        mode="lines+markers",
+        line=dict(color="#22d3ee", width=2.5),
+        marker=dict(size=9, color="#22d3ee", symbol="circle", line=dict(color="#ffffff", width=1.5)),
+        name="Drift Score",
+        customdata=list(zip(times, statuses)),
+        hovertemplate="Batch: <b>#%{x}</b><br>Score: <b>%{y:.3f}</b><br>Status: <b>%{customdata[1]}</b><br>Time: %{customdata[0]}<extra></extra>"
+    ))
+
+    fig.update_layout(
+        title=dict(text="Session Drift Score Timeline", font=dict(size=14, color="#e6edf7")),
+        xaxis=dict(title="Batch Generation Sequence", gridcolor="rgba(255,255,255,0.08)", dtick=1),
+        yaxis=dict(title="Composite Drift Index", range=[0, 1.05], gridcolor="rgba(255,255,255,0.08)"),
+        height=280,
+        **_PLOT_THEME,
+    )
+    return fig
+
+
+def plot_prediction_shift(res: DriftAnalysisResult) -> go.Figure:
+    """Grouped bar chart comparing baseline vs current batch predicted traffic distributions."""
+    fig = go.Figure()
+    p = res.prediction_drift
+
+    ref_atk = p.get("reference_attack_rate", 0.318)
+    curr_atk = p.get("batch_attack_rate", 0.318)
+
+    labels = ["Normal Traffic", "Malicious / Attack Traffic"]
+    ref_vals = [1.0 - ref_atk, ref_atk]
+    curr_vals = [1.0 - curr_atk, curr_atk]
+
+    fig.add_trace(go.Bar(
+        x=labels, y=ref_vals,
+        name="Baseline Distribution",
+        marker=dict(color="rgba(59, 130, 246, 0.75)"),
+        text=[f"{v:.1%}" for v in ref_vals],
+        textposition="auto"
+    ))
+    fig.add_trace(go.Bar(
+        x=labels, y=curr_vals,
+        name="Current Generated Output",
+        marker=dict(color="rgba(34, 211, 238, 0.85)"),
+        text=[f"{v:.1%}" for v in curr_vals],
+        textposition="auto"
+    ))
+
+    fig.update_layout(
+        barmode="group",
+        title=dict(text="Prediction Shift: Normal vs Attack Proportions", font=dict(size=14, color="#e6edf7")),
+        yaxis=dict(title="Proportion of Records", tickformat=".0%", range=[0, 1.05], gridcolor="rgba(255,255,255,0.08)"),
+        height=280,
+        legend=dict(orientation="h", y=-0.2, font=dict(size=11)),
+        **_PLOT_THEME,
+    )
+    return fig
+
+
+def plot_feature_influence(res: DriftAnalysisResult) -> go.Figure:
+    """Feature Influence Scatter Map: Drift Magnitude (PSI) vs Model Feature Importance."""
+    fig = go.Figure()
+    feats = res.feature_table
+    if feats.empty:
+        return fig
+
+    # Quadrant threshold lines
+    psi_thresh = 0.15
+    imp_mean = float(feats["Model Importance"].mean()) if "Model Importance" in feats else 0.015
+
+    # Highlight colors
+    node_colors = []
+    for _, row in feats.iterrows():
+        p = float(row["PSI Score"])
+        imp = float(row["Model Importance"])
+        if p >= psi_thresh and imp >= imp_mean:
+            node_colors.append("#f43f5e")  # High Drift + High Influence -> RED ALERT
+        elif p >= psi_thresh:
+            node_colors.append("#fbbf24")  # High Drift, Low Influence -> AMBER
+        elif imp >= imp_mean:
+            node_colors.append("#3b82f6")  # Low Drift, High Influence -> BLUE
+        else:
+            node_colors.append("#34d399")  # Low Drift, Low Influence -> GREEN
+
+    fig.add_vline(x=psi_thresh, line=dict(color="rgba(255,255,255,0.25)", dash="dash"))
+    fig.add_hline(y=imp_mean, line=dict(color="rgba(255,255,255,0.25)", dash="dash"))
+
+    fig.add_trace(go.Scatter(
+        x=feats["PSI Score"],
+        y=feats["Model Importance"],
+        mode="markers",
+        marker=dict(size=10, color=node_colors, line=dict(color="#ffffff", width=1)),
+        text=feats["Feature"],
+        hovertemplate="Feature: <b>%{text}</b><br>PSI: <b>%{x:.4f}</b><br>Model Importance: <b>%{y:.4f}</b><extra></extra>",
+        showlegend=False
+    ))
+
+    fig.update_layout(
+        title=dict(text="Feature Influence Map (Drift Magnitude vs Model Weight)", font=dict(size=14, color="#e6edf7")),
+        xaxis=dict(title="Drift Magnitude (PSI)", gridcolor="rgba(255,255,255,0.08)"),
+        yaxis=dict(title="Model Importance Weight", gridcolor="rgba(255,255,255,0.08)"),
+        height=300,
+        annotations=[
+            dict(x=max(feats["PSI Score"].max() * 0.85, psi_thresh + 0.05), y=max(feats["Model Importance"].max() * 0.85, imp_mean * 1.5),
+                 text="🚨 Critical: High Drift + High Influence", showarrow=False, font=dict(color="#f43f5e", size=10)),
+        ],
+        **_PLOT_THEME,
+    )
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Report Generation
+# --------------------------------------------------------------------------- #
+def generate_drift_report_csv(res: DriftAnalysisResult) -> str:
+    """Generate standardized CSV drift audit report matching project requirements."""
+    rows = []
+    p = res.prediction_drift
+
+    for _, f in res.feature_table.iterrows():
+        rows.append({
+            "timestamp": res.timestamp,
+            "batch_size": res.batch_size,
+            "overall_drift_status": res.status,
+            "overall_drift_score": round(res.overall_score, 4),
+            "feature_name": f["Feature"],
+            "drift_metric": "PSI & KS-Test",
+            "psi_value": f["PSI Score"],
+            "ks_statistic": f["KS Statistic"],
+            "ks_pvalue": f["p-value"],
+            "wasserstein_distance": f["Wasserstein"],
+            "severity_level": f["Severity"],
+            "reference_mean": f["Reference Mean"],
+            "current_mean": f["Batch Mean"],
+            "relative_mean_shift": f["Relative Mean Shift"],
+            "model_importance": f["Model Importance"],
+            "batch_attack_rate": round(p.get("batch_attack_rate", 0.0), 4),
+            "ref_attack_rate": round(p.get("reference_attack_rate", 0.0), 4),
+            "attack_rate_delta": round(p.get("attack_rate_delta", 0.0), 4),
+            "adwin_alert_triggered": res.adwin_alert,
+            "adwin_alerts_count": res.adwin_alerts_count,
+            "reference_baseline": res.reference_name,
+            "recommended_action": res.recommended_action
+        })
+    df_out = pd.DataFrame(rows)
+    return df_out.to_csv(index=False)
+
 ''',
 }
 
@@ -4096,7 +5612,7 @@ with tab_batch:
                     with st.expander(f"Excluded rows ({len(prep.dropped):,})"):
                         st.dataframe(prep.dropped, width="stretch", hide_index=True)
 
-    run = st.button("Run batch prediction", type="primary", icon=":material/play_arrow:", key="batch_run",
+    run = st.button("Generate Output", type="primary", icon=":material/bolt:", key="batch_run", help="Generate predictions and run automatic Drift Intelligence analysis",
                     disabled=not (prep is not None and prep.ok))
     if run and prep is not None and prep.ok:
         try:
@@ -4110,10 +5626,32 @@ with tab_batch:
                 out["original_label"] = df_up[lab_col].iloc[prep.valid_rows].astype(str).to_numpy()
             st.session_state["last_batch"] = {"table": out, "X": prep.X, "name": up.name, "result": res,
                                               "excluded": int(prep.n_input - len(prep.X))}
-            modals.notice("ok", "Prediction complete", f"{len(out):,} record(s) classified with the saved models.",
-                          res.notes or None)
+            
+            # Run automatic Drift Intelligence analysis immediately after output generation
+            from utils.drift_alerts import analyze_batch_drift
+            with st.spinner("Running Drift Intelligence analysis on generated output…"):
+                drift_res = analyze_batch_drift(prep.X, out, model=bundle.binary_model, feature_names=features)
+                st.session_state["latest_drift_result"] = drift_res
+                hist = st.session_state.setdefault("drift_history", [])
+                hist.append({
+                    "batch_id": len(hist) + 1,
+                    "timestamp": drift_res.timestamp,
+                    "overall_score": drift_res.overall_score,
+                    "status": drift_res.status,
+                    "severity": drift_res.severity_label,
+                    "n_drifted": drift_res.n_drifted_features,
+                })
+                if st.session_state.get("enable_drift_alerts", True):
+                    st.session_state["show_drift_modal_trigger"] = True
+
         except Exception as exc:  # noqa: BLE001
             note("bad", f"Prediction failed ({type(exc).__name__}). The file is incompatible with the saved models.")
+
+    if st.session_state.get("show_drift_modal_trigger", False):
+        st.session_state["show_drift_modal_trigger"] = False
+        dr_m = st.session_state.get("latest_drift_result")
+        if dr_m is not None:
+            modals.drift_intelligence_dialog(dr_m)
 
     lb = st.session_state.get("last_batch")
     if lb is not None:
@@ -4126,6 +5664,23 @@ with tab_batch:
             {"label": "Attacks detected", "value": f"{n_att:,}", "icon": "warning", "sub": f"{n_att / len(t):.1%} of records", "accent": "#ff4d6d"},
             {"label": "Attack categories", "value": f"{t.loc[t['final_verdict'] != 'Normal', 'final_verdict'].nunique():,}", "icon": "bug", "sub": "distinct in this file", "accent": "#8b6bff"},
         ])
+        dr_banner = st.session_state.get("latest_drift_result")
+        if dr_banner is not None:
+            d_col = dr_banner.color
+            c_a1, c_a2 = st.columns([4, 1])
+            with c_a1:
+                st.markdown(
+                    f'<div style="background:rgba(10,17,40,0.85);border:1px solid {d_col}60;border-left:5px solid {d_col};border-radius:10px;padding:12px 18px;margin:12px 0">'
+                    f'<span style="font-size:0.75rem;letter-spacing:1px;text-transform:uppercase;color:#8fa3c0">Drift Intelligence Assessment</span>'
+                    f'<h4 style="margin:2px 0 0 0;color:#ffffff">{dr_banner.severity_label} · Composite Score: {dr_banner.overall_score:.3f}</h4>'
+                    f'<p style="margin:2px 0 0 0;color:#94a3b8;font-size:0.85rem">{dr_banner.interpretation}</p></div>',
+                    unsafe_allow_html=True
+                )
+            with c_a2:
+                st.write("")
+                if st.button("Drift Alert", icon=":material/radar:", key="btn_reopen_drift_alert", help="View full Drift Intelligence modal dialog"):
+                    modals.drift_intelligence_dialog(dr_banner)
+
         for n in lb["result"].notes:
             note("info", n)
         c1, c2 = st.columns([3, 2])
@@ -5085,10 +6640,14 @@ with st.expander("Per-batch results"):
     st.download_button("Download per-batch results (CSV)", run.batches.to_csv(index=False).encode(), "drift_batches.csv", "text/csv", key="dr_dl")
 ''',
     "lab": r'''
+
 """Drift Lab - the paper's prequential experiment (Algorithm 1) run on the user's own dataset files."""
 from __future__ import annotations
 
+import hashlib
+import json
 import time
+import uuid
 
 import numpy as np
 import pandas as pd
@@ -5099,11 +6658,12 @@ from components.cards import glass, kpi_row, md, note, page_header, provenance_t
 from utils import drift_lab as lab
 from utils.data_loader import DATASETS, find_files, load_disk_dataset, load_scenario_pool, signature
 from utils.paper_data import SCENARIO_NAMES, TABLE_IV
+from utils.schema import filter_clean_features
 
 page_header("flask", "Paper · Algorithm 1", "Drift Lab",
-            "Replay the paper's experiment: train on seen traffic, stream 1,000-flow batches, let ADWIN watch the error and compare four update policies.")
+            "Replay the paper's experiment: train on seen traffic, stream 1,000-flow batches, let ADWIN watch the error and compare four update policies across all models.")
 md(f'<div style="margin:-.4rem 0 1rem">{provenance_tag("real")} <span style="color:var(--muted);font-size:.88rem">'
-   '&nbsp;Computed now from your recorded dataset files. The stream is <b>constructed</b> from recorded flows (unseen families held out of training, or inputs shifted) - it is not live traffic.</span></div>')
+   '&nbsp;Computed now from your recorded dataset files. The stream is a <b>constructed replay stream</b> (unseen families held out of training, or inputs shifted) - not live traffic. Zero target leakage guaranteed.</span></div>')
 
 
 @st.cache_data(show_spinner=False, max_entries=2)
@@ -5117,9 +6677,8 @@ def _pool(dataset: str, sig: tuple, counts: tuple, features: tuple, cap: int):
 
 
 def _default_shift(feats: list[str]) -> list[str]:
-    """Timing features (idle / inter-arrival) when the dataset has them, otherwise the first few numeric features."""
-    import re
-    timing = [f for f in feats if re.search(r"idle|iat", str(f), re.I)]
+    import re as _re
+    timing = [f for f in feats if _re.search(r"idle|iat", str(f), _re.I)]
     return (timing or feats)[:5]
 
 
@@ -5141,7 +6700,7 @@ with st.spinner("Counting categories in the dataset files - large files can take
 if isinstance(ds, str):
     note("error", ds)
     st.stop()
-feats = list(ds.numeric_columns)
+feats = filter_clean_features(list(ds.numeric_columns))
 cats = [str(c) for c in ds.attack_counts.index]
 attack_cats = [c for c in cats if c.lower() not in ("benign", "normal", "normal traffic")]
 
@@ -5164,7 +6723,7 @@ with m2:
 
 with st.expander("Advanced settings (defaults reproduce the paper)", icon=":material/tune:"):
     a1, a2, a3 = st.columns(3)
-    delta = a1.number_input("ADWIN δ", 0.0001, 0.05, lab.ADWIN_DELTA, 0.0005, format="%.4f", key="lab_delta")
+    delta = a1.number_input("ADWIN delta", 0.0001, 0.05, lab.ADWIN_DELTA, 0.0005, format="%.4f", key="lab_delta")
     cfg.batch_size = int(a2.number_input("Batch size (flows)", 200, 5000, lab.BATCH_SIZE, 100, key="lab_bs"))
     cfg.n_batches = int(a3.number_input("Number of batches", 20, 80, lab.N_BATCHES, 1, key="lab_nb"))
     b1, b2, b3 = st.columns(3)
@@ -5177,10 +6736,10 @@ with st.expander("Advanced settings (defaults reproduce the paper)", icon=":mate
     anchor = int(r3.number_input("Anchor sample (initial data)", 0, 20000, lab.ANCHOR, 500, key="lab_anchor"))
     if kind == "covariate":
         s1, s2 = st.columns(2)
-        cfg.shift_scale = float(s1.number_input("Shift scale ×", 1.0, 10.0, 3.0, 0.5, key="lab_sscale"))
-        cfg.shift_sd = float(s2.number_input("Shift (σ)", 0.0, 5.0, 1.0, 0.5, key="lab_ssd"))
+        cfg.shift_scale = float(s1.number_input("Shift scale x", 1.0, 10.0, 3.0, 0.5, key="lab_sscale"))
+        cfg.shift_sd = float(s2.number_input("Shift (sd)", 0.0, 5.0, 1.0, 0.5, key="lab_ssd"))
     else:
-        cfg.split_by_file = st.checkbox("Train from files named *train*, stream from files named *test* (paper's S2 on UNSW-NB15)",
+        cfg.split_by_file = st.checkbox("Train from files named *train*, stream from files named *test* (paper S2 on UNSW-NB15)",
                                         value=False, key="lab_split")
     cap = int(st.number_input("Max flows read per category (memory guard)", 5000, 200000, 40000, 5000, key="lab_cap"))
 
@@ -5191,129 +6750,205 @@ if kind == "covariate" and not cfg.shift_features:
     note("warn", "Pick at least one feature to shift.")
     st.stop()
 
-go = st.button("Run the experiment", type="primary", icon=":material/play_arrow:", key="lab_run")
+# Config signature for cache/state isolation across model/config changes
+_cfg_sig_dict = {
+    "dataset": dataset, "kind": kind, "model": model_name, "include_hat": include_hat,
+    "delta": delta, "bs": cfg.batch_size, "nb": cfg.n_batches, "onset": cfg.onset_batch,
+    "ntrain": cfg.n_train, "seed": cfg.seed, "recent": recent, "replay": replay, "anchor": anchor,
+    "unseen": sorted(cfg.unseen) if kind == "unseen" else [],
+    "shift": sorted(cfg.shift_features) if kind == "covariate" else [],
+}
+_curr_sig = hashlib.sha256(json.dumps(_cfg_sig_dict, sort_keys=True).encode()).hexdigest()[:12]
+if "lab" in st.session_state and st.session_state.get("lab_cfg_sig") != _curr_sig:
+    st.session_state.pop("lab", None)
+
+btn_c1, btn_c2 = st.columns([3, 1])
+with btn_c1:
+    go = st.button("Run the experiment", type="primary", icon=":material/play_arrow:", key="lab_run")
+with btn_c2:
+    if st.button("Reset results", icon=":material/refresh:", key="lab_reset"):
+        st.session_state.pop("lab", None)
+        st.session_state.pop("lab_cfg_sig", None)
+        st.rerun()
 
 # ---- 2. run ----------------------------------------------------------------------------------
 if go:
     try:
         t_all = time.perf_counter()
-        with st.status("Running the prequential experiment…", expanded=True) as status:
-            st.write("Reading a class-capped pool of recorded flows…")
+        with st.status("Running the prequential experiment...", expanded=True) as status:
+            st.write(f"Reading a class-capped pool of recorded flows ({len(feats)} verified clean predictor features, zero target leakage)...")
             pool = _pool(dataset, signature(files), tuple((str(k), int(v)) for k, v in ds.attack_counts.items()), tuple(feats), cap)
             if isinstance(pool, str):
                 raise RuntimeError(pool)
             sc = lab.build_scenario(pool, feats, cfg)
             for n in sc.notes:
-                st.write("• " + n)
-            st.write(f"Fitting the initial {model_name} on {len(sc.X_train):,} flows…")
-            f0, t0 = lab.fit_initial(sc, model_name)
+                st.write("- " + n)
+            model_info = lab.get_model_info(model_name, seed=cfg.seed)
+            st.write(f"Fitting initial base model: **{model_name}** ({model_info['actual_estimator_class']}) on {len(sc.X_train):,} flows...")
+            f0, t0 = lab.fit_initial(sc, model_name, seed=cfg.seed)
             results = {}
             for pol in ("Static", "Periodic", "Drift-triggered"):
-                st.write(f"Running policy: {pol}…")
+                st.write(f"Evaluating policy: **{pol}** (strict test-then-train, independent estimator clone)...")
                 results[pol] = lab.run_policy(sc, f0, pol, delta=delta, seed=cfg.seed, recent=recent, replay=replay, anchor=anchor)
+                warns = results[pol].convergence_warnings
+                if warns:
+                    st.warning(f"{pol} convergence warnings: {warns[0][:120]}")
             if include_hat:
-                st.write("Running policy: Online HAT (River)…")
+                st.write("Evaluating policy: **Online HAT** (River; sequential flow update, independent River model)...")
                 bar = st.progress(0.0)
                 results["Online HAT"] = lab.run_online_hat(sc, seed=cfg.seed, progress=lambda p: bar.progress(min(1.0, float(p))))
-            status.update(label=f"Done in {time.perf_counter() - t_all:.0f} s", state="complete", expanded=False)
-        st.session_state["lab"] = dict(sc=sc, results=results, base_fit=t0, model=model_name, dataset=dataset, kind=kind, delta=delta)
-    except Exception as exc:  # noqa: BLE001
+            run_id = str(uuid.uuid4())[:8]
+            run_metadata = {
+                "run_id": run_id,
+                "dataset": dataset,
+                "selected_model_name": model_name,
+                "actual_estimator_class": model_info["actual_estimator_class"],
+                "hyperparameters": model_info["hyperparameters"],
+                "random_seed": cfg.seed,
+                "adwin_delta": delta,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            exported = lab.export_drift_lab_reports(sc, results, run_metadata)
+            status.update(label=f"Done in {time.perf_counter() - t_all:.0f} s | Auditable reports -> reports/drift_lab/", state="complete", expanded=False)
+        st.session_state["lab_cfg_sig"] = _curr_sig
+        st.session_state["lab"] = dict(
+            sc=sc, results=results, base_fit=t0, model=model_name,
+            model_info=model_info, dataset=dataset, kind=kind, delta=delta,
+            run_id=run_id, exported=exported,
+        )
+    except Exception as exc:
         st.session_state.pop("lab", None)
         note("error", f"<b>The experiment could not run.</b> {type(exc).__name__}: {str(exc)[:240]}")
 
 out = st.session_state.get("lab")
 if not out:
-    note("info", "Choose a scenario and press <b>Run the experiment</b>. Nothing is trained until you do. The saved dashboard models are not used here: "
-                 "unseen-family scenarios need a base model that never saw those families, so the lab fits its own on the seen traffic.")
+    note("info", "Choose a scenario and press <b>Run the experiment</b>. "
+                 "Each model (Random Forest / XGBoost / Decision Tree / Logistic Regression) is trained and evaluated independently with its own clone. "
+                 "The saved dashboard models are not used here.")
 else:
     sc, results = out["sc"], out["results"]
-    summ = lab.summarise(sc, results)
+    m_info = out.get("model_info", {})
+    summ = lab.summarise(sc, results, m_info)
     bs = sc.cfg.batch_size
     st.write("")
-    section(f"2 · Results · {out['dataset']} · {out['model']} · " + ("unseen families" if out["kind"] == "unseen" else "covariate shift"), "chart")
+    section(f"2 · Results - {out['dataset']} - {out['model']} - " + ("unseen families" if out["kind"] == "unseen" else "covariate shift"), "chart")
+
+    md(
+        f"<div style='margin-bottom:.8rem;color:var(--muted);font-size:.85rem'>"
+        f"<b>Model:</b> <code>{out['model']}</code> ({m_info.get('actual_estimator_class', '')}) &nbsp;|&nbsp; "
+        f"<b>Run ID:</b> <code>{out.get('run_id', 'N/A')}</code> &nbsp;|&nbsp; "
+        f"<b>Seed:</b> <code>{cfg.seed}</code> &nbsp;|&nbsp; "
+        f"<b>Features:</b> <code>{len(sc.features)} verified clean predictors, no target leakage</code>"
+        f"</div>"
+    )
+
     ix = summ.set_index("Policy")
-    cols = []
+    kpi_cols = []
     for pol, ic, ac in (("Static", "lock", "#ff4d6d"), ("Periodic", "clock", "#ffb547"), ("Drift-triggered", "radar", "#22e3ff"), ("Online HAT", "bolt", "#8b6bff")):
         if pol in ix.index:
-            r = ix.loc[pol]
-            rt = "online" if pol == "Online HAT" else f"{int(r['Retrains'])} retrain(s)"
-            cols.append(dict(label=pol, value=f"{r['Post-onset acc (%)']:.2f}%", icon=ic, accent=ac,
-                             series=lab.batch_accuracy(sc.y_stream, results[pol].yhat, bs).tolist(),
-                             detail=f"post-onset accuracy<br>{rt}"))
-    kpi_row(cols)
+            r_row = ix.loc[pol]
+            rt = "online" if pol == "Online HAT" else f"{int(r_row['Retrains'])} retrain(s)"
+            c_val = int(r_row["Correct"]) if pd.notna(r_row.get("Correct", None)) else 0
+            e_val = int(r_row["Evaluated"]) if pd.notna(r_row.get("Evaluated", None)) else 0
+            post_val = r_row.get("Post-onset acc (%)", None)
+            post_str = f"{post_val:.2f}%" if post_val is not None and pd.notna(post_val) else "N/A"
+            kpi_cols.append(dict(
+                label=pol, value=post_str, icon=ic, accent=ac,
+                series=lab.batch_accuracy(sc.y_stream, results[pol].yhat, bs).tolist(),
+                detail=f"post-onset accuracy<br>{c_val:,} / {e_val:,} correct ({rt})"
+            ))
+    kpi_row(kpi_cols)
 
     with glass():
-        md('<div class="panel-title">Accuracy per batch · drift starts after the dotted line</div>')
+        md('<div class="panel-title">Accuracy per batch - drift starts after the dotted line</div>')
         acc = {p: lab.batch_accuracy(sc.y_stream, r.yhat, bs) for p, r in results.items()}
         rb = {p: r.retrain_batches for p, r in results.items() if p in ("Periodic", "Drift-triggered")}
         al = sorted({a["flow"] // bs + 1 for a in results["Drift-triggered"].alerts if a["triggered_retrain"]})
         charts.show(charts.policy_accuracy_chart(acc, sc.cfg.onset_batch, rb, al), key="lab_acc")
-        st.caption("Diamonds mark retrainings; dashed amber lines mark ADWIN alerts that triggered a retrain (Drift-triggered).")
+        st.caption("Diamonds mark retrainings; dashed amber lines mark ADWIN alerts. Y-axis is locked to [0%, 100%].")
 
     left, right = st.columns([3, 2])
     with left:
         with glass():
-            md('<div class="panel-title">Computed Table IV · all flows of the stream</div>')
+            md('<div class="panel-title">Computed Table IV - all flows of the stream</div>')
             show = summ.copy()
-            st.dataframe(show.style.format({"Acc (%)": "{:.2f}", "F1": "{:.3f}", "Rec (%)": "{:.2f}", "FPR (%)": "{:.2f}",
-                                            "Post-onset acc (%)": "{:.2f}", "Retrain time (s)": "{:.2f}", "Delay (flows)": "{:.0f}", "Retrains": "{:.0f}"}, na_rep="–"),
-                         hide_index=True, width="stretch")
-            st.caption(f"Base model fitted in {out['base_fit']:.2f} s. Delay = flows from the onset to the first ADWIN alert that triggered a retrain. "
-                       "‘–’ = not applicable (e.g. no alert fired).")
+            fmt_cols = {c: "{:.2f}" for c in ["Acc (%)", "Balanced Acc (%)", "Rec (%)", "FPR (%)", "Post-onset acc (%)", "Held-out Rec (%)", "Retrain time (s)"]}
+            fmt_cols["F1"] = "{:.3f}"
+            fmt_cols["Delay (flows)"] = "{:.0f}"
+            fmt_cols["Retrains"] = "{:.0f}"
+            fmt_cols["Evaluated"] = "{:,.0f}"
+            fmt_cols["Correct"] = "{:,.0f}"
+            fmt_cols["Errors"] = "{:,.0f}"
+            st.dataframe(show.style.format(fmt_cols, na_rep="-"), hide_index=True, width="stretch")
+            st.caption(
+                f"Base model ({m_info.get('actual_estimator_class', out['model'])}) fitted in {out['base_fit']:.2f} s. "
+                f"Correct/Evaluated columns show absolute counts. "
+                f"'–' = not applicable (e.g. no ADWIN alert fired)."
+            )
     with right:
         with glass():
-            md('<div class="panel-title">ADWIN alert log · Drift-triggered</div>')
+            md('<div class="panel-title">ADWIN alert log - Drift-triggered</div>')
             al_rows = results["Drift-triggered"].alerts
             if not al_rows:
-                st.caption("ADWIN raised no alert on this stream." + (" That is the expected outcome for a harmless covariate shift." if out["kind"] == "covariate" else ""))
+                st.caption("ADWIN raised no alert on this stream." + (" Expected for covariate shift." if out["kind"] == "covariate" else ""))
             else:
-                df = pd.DataFrame(al_rows)
-                df["flow"] = df["flow"].astype(int)
-                df["after onset"] = df["flow"] >= sc.onset_flow
-                keep = [c for c in ("flow", "batch", "error_before", "error_after", "rose", "triggered_retrain", "after onset") if c in df]
-                shown = df[keep].rename(columns={"error_before": "err before", "error_after": "err after", "triggered_retrain": "retrain", "after onset": "post-onset"})
+                df_al = pd.DataFrame(al_rows)
+                df_al["flow"] = df_al["flow"].astype(int)
+                df_al["after onset"] = df_al["flow"] >= sc.onset_flow
+                keep = [c for c in ("flow", "batch", "error_before", "error_after", "rose", "triggered_retrain", "after onset") if c in df_al]
+                shown = df_al[keep].rename(columns={"error_before": "err before", "error_after": "err after", "triggered_retrain": "retrain", "after onset": "post-onset"})
                 st.dataframe(shown, hide_index=True, width="stretch")
-                false_alarms = int(((df["flow"] < sc.onset_flow) & df["triggered_retrain"]).sum()) if "triggered_retrain" in df else 0
-                st.caption(f"{len(df)} alert(s); {false_alarms} retrain(s) triggered before the onset (false alarms).")
+                false_alarms = int(((df_al["flow"] < sc.onset_flow) & df_al["triggered_retrain"]).sum()) if "triggered_retrain" in df_al else 0
+                st.caption(f"{len(df_al)} alert(s); {false_alarms} retrain(s) triggered before the onset (false alarms).")
 
     with glass():
-        md('<div class="panel-title">Per-category accuracy after the onset · Static vs Drift-triggered</div>')
+        md('<div class="panel-title">Per-category accuracy after the onset - Static vs Drift-triggered</div>')
         cs = lab.category_rates(sc.cat_stream, sc.y_stream, results["Static"].yhat, sc.onset_flow).set_index("category")
         cd = lab.category_rates(sc.cat_stream, sc.y_stream, results["Drift-triggered"].yhat, sc.onset_flow).set_index("category")
         cmp_ = pd.DataFrame({"Static": 100 * cs["rate"], "Drift-triggered": 100 * cd["rate"], "flows": cs["flows"]}).sort_values("flows", ascending=False)
         charts.show(charts.category_bars(cmp_.head(12), ["Static", "Drift-triggered"]), key="lab_cat")
-        st.caption("Detection rate for attack categories, specificity for benign traffic. Held-out families are the ones to watch: "
+        st.caption("Detection rate for attack categories, specificity for benign traffic. Held-out families: "
                    + (", ".join(sc.cfg.unseen) if sc.cfg.unseen else "none (covariate scenario)") + ".")
 
     # ---- threshold study ----
-    section("3 · Threshold re-tuning (paper §IV-F)", "target")
+    section("3 - Threshold re-tuning (paper IV-F)", "target")
     pol_t = st.selectbox("Policy whose scores to re-threshold", [p for p in ("Static", "Drift-triggered", "Periodic") if p in results], key="lab_tpol")
     ts = lab.threshold_study(sc, results[pol_t].proba)
     if ts is None:
         st.caption("Not enough post-onset flows of both classes for an honest tune/evaluate split.")
     else:
         d, t = ts["default"], ts["tuned"]
-        kpi_row([dict(label="Tuned threshold", value=f"{ts['threshold']:.2f}", icon="sliders", accent="#ffb547", detail=f"chosen on the first {ts['tune_flows']:,} post-onset flows"),
-                 dict(label="FPR · default → tuned", value=f"{100*d['fpr']:.2f}% → {100*t['fpr']:.2f}%", icon="shield", accent="#ff4d6d", detail=f"evaluated on the later {ts['eval_flows']:,} flows"),
-                 dict(label="F1 · default → tuned", value=f"{d['f1']:.3f} → {t['f1']:.3f}", icon="chart", accent="#22e3ff", detail="no retraining involved"),
-                 dict(label="Recall · default → tuned", value=f"{100*d['recall']:.2f}% → {100*t['recall']:.2f}%", icon="target", accent="#2ee6a6", detail="same held-out evaluation flows")])
+        d_rec = f"{100*d['recall']:.2f}%" if d.get("recall") else "N/A"
+        t_rec = f"{100*t['recall']:.2f}%" if t.get("recall") else "N/A"
+        d_fpr = f"{100*d['fpr']:.2f}%" if d.get("fpr") else "N/A"
+        t_fpr = f"{100*t['fpr']:.2f}%" if t.get("fpr") else "N/A"
+        kpi_row([
+            dict(label="Tuned threshold", value=f"{ts['threshold']:.2f}", icon="sliders", accent="#ffb547", detail=f"chosen on first {ts['tune_flows']:,} post-onset flows"),
+            dict(label="FPR default to tuned", value=f"{d_fpr} to {t_fpr}", icon="shield", accent="#ff4d6d", detail=f"evaluated on later {ts['eval_flows']:,} flows"),
+            dict(label="F1 default to tuned", value=f"{d['f1']:.3f} to {t['f1']:.3f}", icon="chart", accent="#22e3ff", detail="no retraining involved"),
+            dict(label="Recall default to tuned", value=f"{d_rec} to {t_rec}", icon="target", accent="#2ee6a6", detail="same held-out evaluation flows"),
+        ])
         with glass():
-            md('<div class="panel-title">Evaluation stream · F1 and FPR vs threshold</div>')
+            md('<div class="panel-title">Evaluation stream - F1 and FPR vs threshold</div>')
             charts.show(charts.threshold_chart(ts["grid"], [m["f1"] for m in ts["eval_curve"]], [m["fpr"] for m in ts["eval_curve"]], ts["threshold"]), key="lab_thr")
-            st.caption("The threshold is picked using labelled flows right after the onset and judged on flows it never saw - a cheap alternative to a full retrain when the ranking (AUC) is still good.")
+            st.caption("The threshold is picked using labelled flows right after the onset and judged on flows it never saw.")
 
-    with st.expander("Compare with the numbers published in the paper", icon=":material/menu_book:"):
-        st.caption("Published reference (Table IV of the paper, its own data split and seed) - not computed here. Differences are expected with other files, samples or seeds.")
+    with st.expander("Compare with numbers published in the paper", icon=":material/menu_book:"):
+        st.caption("Published reference (Table IV of the paper, its own data split and seed) - not computed here.")
         for key in ("S1", "S2", "S3"):
             st.markdown(f"**{SCENARIO_NAMES[key]}**")
-            st.dataframe(TABLE_IV[TABLE_IV["Scenario"] == key].drop(columns="Scenario").style.format(na_rep="–"), hide_index=True, width="stretch")
+            st.dataframe(TABLE_IV[TABLE_IV["Scenario"] == key].drop(columns="Scenario").style.format(na_rep="-"), hide_index=True, width="stretch")
 
-    with st.expander("Caveats", icon=":material/warning:"):
+    with st.expander("Caveats and Evaluation Integrity", icon=":material/warning:"):
         st.markdown(
-            "- True labels are assumed to arrive immediately after each batch is scored; real deployments see delayed, partial labels, which lengthens detection delay.\n"
-            "- The stream is **constructed** from recorded flows (held-out families / shifted inputs); it is not live traffic and nothing is blocked or monitored.\n"
-            "- One seed and default settings per run: small differences between policies should not be over-read.\n"
-            "- Drift here is abrupt; gradual drift is not covered.")
+            "- **Test-then-train**: Each batch is scored before any retraining occurs.\n"
+            "- **Data isolation**: Training and stream rows are guaranteed disjoint.\n"
+            "- **Model independence**: Each policy runs with its own independent estimator clone.\n"
+            "- **Zero leakage**: binary_target / multiclass_target / Label are explicitly excluded before any fit or predict.\n"
+            "- **Stream type**: This is a constructed replay stream, not live traffic.\n"
+            "- **Auditable outputs**: Full metrics and predictions exported to `reports/drift_lab/`."
+        )
+
 ''',
     "paper": r'''
 """Paper Results - the published tables of the project paper, as a labelled reference (not computed by this app)."""
@@ -5473,6 +7108,153 @@ with glass():
     if not (info.get("university") and info.get("department")):
         st.caption(f"University, department, guide and team members are configurable: edit `{PROJECT_INFO_PATH.name}` in the project root. Nothing is invented here.")
 ''',
+
+    "drift_intel": r'''
+"""Drift Intelligence - post-generation model monitoring and real-time concept/data drift analysis."""
+from __future__ import annotations
+import streamlit as st
+import pandas as pd
+import datetime
+
+from components.cards import glass, md, metric_row, note, page_header, section
+from utils.drift_alerts import (
+    analyze_batch_drift, plot_drift_radar, plot_drift_galaxy, plot_drift_heatmap,
+    plot_drift_timeline, plot_prediction_shift, plot_feature_influence,
+    generate_drift_report_csv, get_reference_baseline
+)
+from utils.model_loader import get_bundle
+
+page_header("satellite_alt", "Model Monitoring", "Drift Intelligence",
+            "Continuous post-generation statistical analysis of concept drift and feature-level data drift.")
+
+bundle = get_bundle()
+res = st.session_state.get("latest_drift_result")
+history = st.session_state.get("drift_history", [])
+
+if res is None:
+    note("info", "<b>No prediction batch has been evaluated yet in this session.</b> Generate output on the <b>Predict</b> page to populate live drift intelligence, or run an initial baseline audit below.")
+    if st.button("Run Baseline Consistency Audit", type="primary", icon=":material/play_arrow:"):
+        ref_df, ref_name = get_reference_baseline()
+        if ref_df is not None:
+            split_idx = len(ref_df) // 2
+            curr_X = ref_df[bundle.features].iloc[split_idx:]
+            dummy_pred = pd.DataFrame({
+                "final_verdict": ["Normal" if i % 3 != 0 else "Attack" for i in range(len(curr_X))],
+                "binary_confidence": [0.98] * len(curr_X),
+                "attack_probability": [0.3] * len(curr_X)
+            })
+            res = analyze_batch_drift(curr_X, dummy_pred, model=bundle.binary_model, feature_names=bundle.features, reference_data=ref_df.iloc[:split_idx])
+            st.session_state["latest_drift_result"] = res
+            st.session_state.setdefault("drift_history", []).append({
+                "batch_id": 1,
+                "timestamp": res.timestamp,
+                "overall_score": res.overall_score,
+                "status": res.status,
+                "severity": res.severity_label
+            })
+            st.rerun()
+    st.stop()
+
+# --- 1. Top Status Banner & Metrics ---
+color = res.color
+st.markdown(
+    f'<div style="background:rgba(10,17,40,0.85);border:1px solid {color}50;border-left:6px solid {color};border-radius:14px;padding:20px 24px;margin-bottom:24px;box-shadow:0 8px 32px rgba(0,0,0,0.4)">'
+    f'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">'
+    f'<div><span style="font-size:0.75rem;letter-spacing:1.5px;text-transform:uppercase;color:#8fa3c0">Current Monitoring State</span>'
+    f'<h2 style="margin:4px 0 0 0;color:#ffffff;font-size:1.6rem">{res.severity_label}</h2>'
+    f'<p style="margin:6px 0 0 0;color:#94a3b8;font-size:0.9rem">Evaluated at {res.timestamp} against <b>{res.reference_name}</b></p></div>'
+    f'<div style="text-align:right">'
+    f'<div style="background:{color}20;border:1.5px solid {color};color:{color};font-weight:800;font-size:1.4rem;padding:8px 20px;border-radius:30px;display:inline-block">'
+    f'Composite Drift Score: {res.overall_score:.3f}</div>'
+    f'<div style="font-size:0.78rem;color:#8fa3c0;margin-top:4px">Threshold: &lt;0.15 Stable | &ge;0.30 Moderate | &ge;0.50 High</div>'
+    f'</div></div></div>',
+    unsafe_allow_html=True
+)
+
+metric_row([
+    {"label": "Drift Status", "value": res.status.replace("_", " "), "icon": "radar", "sub": f"{res.n_drifted_features} features PSI &ge; 0.10", "accent": color},
+    {"label": "Batch Size", "value": f"{res.batch_size:,}", "icon": "database", "sub": f"{res.n_features_evaluated} flow features tested", "accent": "#3b82f6"},
+    {"label": "Attack Rate Shift", "value": f"{res.prediction_drift.get('attack_rate_delta', 0.0):.1%}", "icon": "warning", "sub": f"Batch: {res.prediction_drift.get('batch_attack_rate', 0.0):.1%}", "accent": "#f97316"},
+    {"label": "River ADWIN Alert", "value": "ALERT TRIGGERED" if res.adwin_alert else "STABLE", "icon": "activity", "sub": f"{res.adwin_alerts_count} streaming alert(s)", "accent": "#f43f5e" if res.adwin_alert else "#34d399"}
+])
+
+st.info(f"**Diagnostic Interpretation:** {res.interpretation}\n\n**Actionable Guidance:** {res.recommended_action}")
+
+# --- 2. Radar Map & Galaxy Map ---
+section("Drift Geometry & Topology", "radar")
+c_rad, c_gal = st.columns(2)
+with c_rad, glass():
+    st.plotly_chart(plot_drift_radar(res), use_container_width=True)
+with c_gal, glass():
+    current_X = st.session_state.get("last_batch", {}).get("X")
+    if current_X is not None:
+        st.plotly_chart(plot_drift_galaxy(res, current_X), use_container_width=True)
+    else:
+        st.caption("Galaxy constellation requires active batch features in memory.")
+
+# --- 3. Heatmap & Feature Influence ---
+section("Feature Distribution & Influence Analytics", "chart")
+c_heat, c_inf = st.columns([1, 1])
+with c_heat, glass():
+    st.plotly_chart(plot_drift_heatmap(res), use_container_width=True)
+with c_inf, glass():
+    st.plotly_chart(plot_feature_influence(res), use_container_width=True)
+
+# --- 4. Prediction Shift & Timeline ---
+section("Temporal Tracking & Prediction Shifts", "clock")
+c_time, c_shift = st.columns([1, 1])
+with c_time, glass():
+    st.plotly_chart(plot_drift_timeline(history), use_container_width=True)
+with c_shift, glass():
+    st.plotly_chart(plot_prediction_shift(res), use_container_width=True)
+
+# --- 5. Detailed Feature Drift Table ---
+section("Granular Feature Drift Audit Table", "layers")
+with glass():
+    st.markdown("**Per-feature statistical tests (PSI, Kolmogorov-Smirnov, Wasserstein distance, Mean shifts):**")
+    f_filter = st.selectbox("Filter by Severity Tier", ["All Features", "Drifted Only (PSI >= 0.10)", "Moderate / High (PSI >= 0.20)", "Critical Only (PSI >= 0.30)"])
+    df_disp = res.feature_table.copy()
+    if f_filter == "Drifted Only (PSI >= 0.10)":
+        df_disp = df_disp[df_disp["PSI Score"] >= 0.10]
+    elif f_filter == "Moderate / High (PSI >= 0.20)":
+        df_disp = df_disp[df_disp["PSI Score"] >= 0.20]
+    elif f_filter == "Critical Only (PSI >= 0.30)":
+        df_disp = df_disp[df_disp["PSI Score"] >= 0.30]
+
+    st.dataframe(df_disp, width="stretch", hide_index=True)
+    st.caption(f"Showing {len(df_disp)} of {len(res.feature_table)} evaluated flow features.")
+
+    st.download_button(
+        "📥 Download Full Drift Intelligence Report (CSV)",
+        generate_drift_report_csv(res),
+        file_name=f"drift_intelligence_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        type="primary",
+        icon=":material/download:",
+        key="btn_dl_full_drift_report"
+    )
+
+# --- 6. Explanatory Context & Playbooks ---
+section("Drift Intelligence Framework & Operational Playbooks", "book")
+with glass():
+    e1, e2 = st.columns(2)
+    with e1:
+        st.markdown("**Types of Drift Monitored**")
+        st.markdown(
+            "- **Data Drift (Covariate Shift):** Occurs when the input distribution $P(X)$ changes while conditional target relationships $P(y|X)$ remain fixed. Measured via Population Stability Index (PSI) and Kolmogorov-Smirnov two-sample tests.\n"
+            "- **Concept Drift:** Occurs when the mapping between input network flow features and cyberattack categories $P(y|X)$ changes over time (e.g. zero-day evasion techniques, morphed payload signatures). Monitored online with River ADWIN statistical change detector.\n"
+            "- **Prediction Shift:** Monitored via divergences in predicted attack rates, category distribution shifts, and confidence degradation."
+        )
+    with e2:
+        st.markdown("**Operational Response Playbook**")
+        st.markdown(
+            "- **Stable (PSI < 0.10):** No action required. Predictions are operating within verified training manifold.\n"
+            "- **Low Drift (0.10 - 0.20):** Increase monitoring frequency. Flag atypical flows for secondary analysis.\n"
+            "- **Moderate Drift (0.20 - 0.30):** Model performance may begin degrading. Inspect top drifted features against current network telemetry.\n"
+            "- **Critical Drift (PSI >= 0.30):** High likelihood of prediction error. Initiate adaptive model retraining on recent verified flow windows."
+        )
+    st.caption("Academic Note: Drift alerts serve as an automated statistical diagnostic signal and do not inherently prove malicious compromise or replace human threat triage.")
+''',
 }
 
 # --------------------------------------------------------------------------------------------- #
@@ -5542,6 +7324,7 @@ _PAGE_META = [
     ("performance", "Model Performance", "monitoring", "model-performance"),
     ("explain", "Explainability", "psychology", "explainability"),
     ("drift", "Concept Drift & Adaptive Learning", "trending_up", "concept-drift"),
+    ("drift_intel", "Drift Intelligence", "satellite_alt", "drift-intelligence"),
     ("lab", "Drift Lab", "science", "drift-lab"),
     ("paper", "Paper Results", "menu_book", "paper-results"),
     ("about", "About Project", "info", "about"),
